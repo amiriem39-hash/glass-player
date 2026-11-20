@@ -5,6 +5,7 @@ GLASS PLAYER - Kivy (Android)
 مینی‌پلیر، پلیر تمام‌صفحه، دیسک چرخان، ویژوالایزر، شافل/تکرار، رنگ از روی کاور.
 """
 import colorsys
+import base64
 import io
 import math
 import os
@@ -33,6 +34,8 @@ from kivy.uix.floatlayout import FloatLayout
 from kivy.uix.recycleview.views import RecycleDataViewBehavior
 from kivy.uix.slider import Slider
 from kivy.uix.widget import Widget
+from kivy.uix.image import Image as KivyImage
+from kivy.uix.label import Label
 from kivy.utils import platform
 
 try:
@@ -273,22 +276,51 @@ def read_tags(path):
 
 def scan():
     found, seen = [], set()
-    for root in storage_roots():
-        for dp_, dirs, files in os.walk(root):
-            dirs[:] = [d for d in dirs
-                       if not d.startswith(".") and d.lower() not in SKIP_DIRS]
-            for f in files:
-                if not f.lower().endswith(EXTS):
-                    continue
-                p = os.path.join(dp_, f)
-                try:
-                    rp = os.path.realpath(p)
-                    if rp in seen or os.path.getsize(p) < MIN_SIZE:
+    # Query Android's public audio library using the runtime media permission.
+    # This avoids sending the user to the special "All files access" Settings page.
+    if platform == "android":
+        cursor = None
+        try:
+            from jnius import autoclass
+            MediaAudio = autoclass("android.provider.MediaStore$Audio$Media")
+            resolver = get_activity().getContentResolver()
+            cursor = resolver.query(MediaAudio.EXTERNAL_CONTENT_URI, None,
+                                    "is_music != 0", None, "title COLLATE NOCASE ASC")
+            if cursor:
+                data_col = cursor.getColumnIndex("_data")
+                while cursor.moveToNext():
+                    if data_col >= 0:
+                        path = cursor.getString(data_col)
+                        if path and os.path.isfile(path):
+                            real = os.path.realpath(path)
+                            if real not in seen:
+                                seen.add(real)
+                                found.append(path)
+        except Exception:
+            found = []
+        finally:
+            try:
+                if cursor:
+                    cursor.close()
+            except Exception:
+                pass
+    else:
+        for root in storage_roots():
+            for dp_, dirs, files in os.walk(root):
+                dirs[:] = [d for d in dirs
+                           if not d.startswith(".") and d.lower() not in SKIP_DIRS]
+                for f in files:
+                    if not f.lower().endswith(EXTS):
                         continue
-                    seen.add(rp)
-                    found.append(p)
-                except Exception:
-                    pass
+                    p = os.path.join(dp_, f)
+                    try:
+                        rp = os.path.realpath(p)
+                        if rp in seen or os.path.getsize(p) < MIN_SIZE:
+                            continue
+                        seen.add(rp)
+                        found.append(p)
+                    except Exception:
+                        pass
     found.sort(key=lambda p: os.path.basename(p).lower())
     songs = []
     for i, p in enumerate(found):
@@ -1069,31 +1101,12 @@ KV = r'''
         size_hint: 1.32, 1.32
         pos_hint: {'center_x': .5, 'center_y': .5}
         scale: app.bass
-    Disc:
-        id: disc
-        size_hint: .88, .88
-        pos_hint: {'x': .19, 'y': .06}
-    FloatLayout:
-        id: art
-        size_hint: .8, .8
-        pos_hint: {'x': 0, 'y': .1}
-        canvas.before:
-            PushMatrix
-            Rotate:
-                angle: root.ty
-                axis: 1, 0, 0
-                origin: self.center
-            Rotate:
-                angle: root.tx
-                axis: 0, 1, 0
-                origin: self.center
-        canvas.after:
-            PopMatrix
-        CoverBox:
-            id: cov
-            rad: dp(28)
-            hue: app.cur_hue
-            letter: app.cur_letter
+    Image:
+        source: app.player_art_path
+        size_hint: .94, .76
+        pos_hint: {'center_x': .5, 'center_y': .5}
+        allow_stretch: True
+        keep_ratio: True
 
 <Sheet>:
     Backdrop:
@@ -1237,10 +1250,16 @@ KV = r'''
             size_hint_y: None
             height: dp(62)
             padding: dp(16), 0
+            Image:
+                source: app.logo_path
+                size_hint: None, None
+                size: dp(46), dp(46)
+                allow_stretch: True
+                keep_ratio: True
             BoxLayout:
                 orientation: 'vertical'
                 Label:
-                    text: 'Glass Player'
+                    text: 'DCED Plyer'
                     font_size: sp(28)
                     halign: 'left'
                     valign: 'bottom'
@@ -1319,7 +1338,8 @@ KV = r'''
 
 # ------------------------------------------------------------ app
 class GlassApp(App):
-    title = "Glass Player"
+    title = "DCED Plyer"
+    player_art_path = StringProperty("")
     c1 = ListProperty([.486, .302, 1, 1])
     c2 = ListProperty([0, .898, 1, 1])
     has_song = BooleanProperty(False)
@@ -1343,10 +1363,16 @@ class GlassApp(App):
         Window.clearcolor = (.03, .024, .07, 1)
         Window.softinput_mode = "below_target"
         self.songs, self.view, self.q = [], [], ""
+        self.logo_path, self.player_art_path = self._prepare_artwork()
+        self.icon = self.logo_path
+        self._notification_ready = False
+        self._media_session = None
+        self._media_callback = None
         self.cur_path = None
         self.hue, self.t, self.ang, self.errs = 260, 0.0, 0.0, 0
         self.bars = [0.0] * 44
         self.drag = False
+        self._last_notification_update = 0.0
         self.covers = Covers()
         self.engine = Engine(self.on_end, self.on_err)
         Window.bind(on_keyboard=self.on_key)
@@ -1358,26 +1384,219 @@ class GlassApp(App):
         self.sheet, self.rv, self.mini = ids.sheet, ids.rv, ids.mini
         self.sk = self.sheet.ids.sk
         self.viz = self.sheet.ids.viz
-        self.disc = self.sheet.ids.stage.ids.disc
-        self.stage_cov = self.sheet.ids.stage.ids.cov
         Clock.schedule_interval(self.tick, 1 / 24.)
+        self.show_welcome()
         if platform == "android":
-            from android.permissions import request_permissions
-            request_permissions(["android.permission.READ_EXTERNAL_STORAGE",
-                                 "android.permission.READ_MEDIA_AUDIO"],
-                                lambda p, g: Clock.schedule_once(lambda dt: self.rescan(True)))
+            self.init_media_notification()
+            self.request_audio_permissions()
         else:
             self.rescan()
+
+    def _prepare_artwork(self):
+        """Write the bundled artwork into app-private storage."""
+        try:
+            base = self.user_data_dir
+            os.makedirs(base, exist_ok=True)
+            logo_path = os.path.join(base, "dced_logo.jpg")
+            car_path = os.path.join(base, "player_car_art.jpg")
+            if not os.path.isfile(logo_path):
+                with open(logo_path, "wb") as f:
+                    f.write(base64.b64decode(APP_LOGO_B64))
+            if not os.path.isfile(car_path):
+                with open(car_path, "wb") as f:
+                    f.write(base64.b64decode(CAR_ART_B64))
+            return logo_path, car_path
+        except Exception:
+            return "", ""
+
+    def show_welcome(self):
+        """A short translucent glass welcome screen; no image-based loading spinner."""
+        overlay = FloatLayout()
+        with overlay.canvas.before:
+            Color(0.015, 0.025, 0.045, .86)
+            overlay._shade = Rectangle(pos=overlay.pos, size=overlay.size)
+        overlay.bind(pos=lambda w, v: setattr(w._shade, "pos", v),
+                     size=lambda w, v: setattr(w._shade, "size", v))
+
+        panel = BoxLayout(orientation="vertical", size_hint=(.86, .52),
+                          pos_hint={"center_x": .5, "center_y": .5},
+                          padding=(dp(22), dp(22)), spacing=dp(12))
+        with panel.canvas.before:
+            Color(1, 1, 1, .12)
+            panel._glass = RoundedRectangle(pos=panel.pos, size=panel.size,
+                                            radius=[dp(30)])
+            Color(1, 1, 1, .32)
+            panel._edge = Line(rounded_rectangle=(panel.x, panel.y,
+                                panel.width, panel.height, dp(30)), width=1)
+        def panel_shape(*_):
+            panel._glass.pos, panel._glass.size = panel.pos, panel.size
+            panel._edge.rounded_rectangle = (panel.x, panel.y, panel.width,
+                                             panel.height, dp(30))
+        panel.bind(pos=panel_shape, size=panel_shape)
+
+        welcome = Label(text="Welcome To Music Plyer DECD",
+                        font_size="22sp", bold=True, color=(1, 1, 1, 1),
+                        halign="center", valign="middle", size_hint=(1, .20))
+        welcome.bind(size=lambda w, v: setattr(w, "text_size", v))
+        brand = Label(text="DCED Plyer", font_size="15sp",
+                      color=(.35, .95, .91, .95), size_hint=(1, .10))
+        panel.add_widget(welcome)
+        panel.add_widget(brand)
+        overlay.add_widget(panel)
+        self.root.add_widget(overlay)
+        overlay.opacity = 0
+        Animation(opacity=1, d=.35, t="out_quad").start(overlay)
+        Clock.schedule_once(lambda dt: self._hide_welcome(overlay), 2.5)
+
+    def _hide_welcome(self, overlay):
+        anim = Animation(opacity=0, d=.35, t="in_quad")
+        anim.bind(on_complete=lambda *_: self.root.remove_widget(overlay)
+                  if overlay.parent else None)
+        anim.start(overlay)
+
+    def request_audio_permissions(self):
+        try:
+            from android.permissions import request_permissions
+            from jnius import autoclass
+            sdk = autoclass("android.os.Build$VERSION").SDK_INT
+            permissions = (["android.permission.READ_MEDIA_AUDIO"]
+                           if sdk >= 33 else
+                           ["android.permission.READ_EXTERNAL_STORAGE"])
+            # Android 13+ notification permission is requested when declared in the manifest.
+            if sdk >= 33:
+                permissions.append("android.permission.POST_NOTIFICATIONS")
+            def done(perms, grants):
+                Clock.schedule_once(lambda dt: self.rescan(True))
+            request_permissions(permissions, done)
+        except Exception as exc:
+            self.toast("Permission request unavailable")
+            self.rescan(True)
+
+    def init_media_notification(self):
+        """Create Android's media session and notification controls."""
+        if platform != "android":
+            return
+        try:
+            from jnius import autoclass
+            sdk = autoclass("android.os.Build$VERSION").SDK_INT
+            act = get_activity()
+            self._ctx = act.getApplicationContext()
+            self._manager = self._ctx.getSystemService("notification")
+            if sdk >= 26:
+                Channel = autoclass("android.app.NotificationChannel")
+                channel = Channel("dced_music", "DCED Plyer playback", 2)
+                channel.setDescription("Music playback controls")
+                self._manager.createNotificationChannel(channel)
+            MediaSession = autoclass("android.media.session.MediaSession")
+            self._media_session = MediaSession(self._ctx, "DCED Plyer")
+            self._media_session.setFlags(3)
+            self._media_session.setActive(True)
+            self._notification_ready = True
+            self.update_media_notification()
+        except Exception:
+            self._notification_ready = False
+
+    def update_media_notification(self):
+        if (platform != "android" or not getattr(self, "_notification_ready", False)
+                or not self.has_song):
+            return
+        try:
+            from jnius import autoclass
+            MetadataBuilder = autoclass("android.media.MediaMetadata$Builder")
+            PlaybackStateClass = autoclass("android.media.session.PlaybackState")
+            PlaybackBuilder = autoclass("android.media.session.PlaybackState$Builder")
+            NotificationBuilder = autoclass("android.app.Notification$Builder")
+            MediaStyle = autoclass("android.app.Notification$MediaStyle")
+            PendingIntent = autoclass("android.app.PendingIntent")
+            Intent = autoclass("android.content.Intent")
+            BitmapFactory = autoclass("android.graphics.BitmapFactory")
+            RDrawable = autoclass("android.R$drawable")
+            act = get_activity()
+            title = self.cur_title if self.has_song else "DCED Plyer"
+            artist = self.cur_artist if self.has_song else "Welcome to your music"
+            metadata = (MetadataBuilder()
+                        .putString("android.media.metadata.TITLE", title)
+                        .putString("android.media.metadata.ARTIST", artist).build())
+            self._media_session.setMetadata(metadata)
+            position = int(self.engine.pos() * 1000) if self.has_song else 0
+            state = 3 if self.playing else 2
+            actions = (PlaybackStateClass.ACTION_PLAY | PlaybackStateClass.ACTION_PAUSE |
+                       PlaybackStateClass.ACTION_PLAY_PAUSE |
+                       PlaybackStateClass.ACTION_SKIP_TO_NEXT |
+                       PlaybackStateClass.ACTION_SKIP_TO_PREVIOUS |
+                       PlaybackStateClass.ACTION_SEEK_TO)
+            playback = (PlaybackBuilder().setActions(actions)
+                        .setState(state, position, 1.0 if self.playing else 0.0).build())
+            self._media_session.setPlaybackState(playback)
+
+            def pending(action, request_code):
+                intent = Intent(act, act.getClass())
+                intent.putExtra("dced_media_action", action)
+                flags = PendingIntent.FLAG_UPDATE_CURRENT
+                if hasattr(PendingIntent, "FLAG_IMMUTABLE"):
+                    flags |= PendingIntent.FLAG_IMMUTABLE
+                return PendingIntent.getActivity(self._ctx, request_code, intent, flags)
+
+            sdk = autoclass("android.os.Build$VERSION").SDK_INT
+            builder = (NotificationBuilder(self._ctx, "dced_music")
+                       if sdk >= 26 else NotificationBuilder(self._ctx))
+            builder.setContentTitle(title).setContentText(artist)
+            builder.setSmallIcon(RDrawable.ic_media_play)
+            builder.setOngoing(bool(self.playing)).setOnlyAlertOnce(True)
+            builder.setVisibility(1).setContentIntent(pending("open", 10))
+            if self.logo_path:
+                bitmap = BitmapFactory.decodeFile(self.logo_path)
+                if bitmap:
+                    builder.setLargeIcon(bitmap)
+            builder.addAction(RDrawable.ic_media_previous, "Previous", pending("previous", 11))
+            play_icon = RDrawable.ic_media_pause if self.playing else RDrawable.ic_media_play
+            builder.addAction(play_icon, "Play/Pause", pending("toggle", 12))
+            builder.addAction(RDrawable.ic_media_next, "Next", pending("next", 13))
+            style = MediaStyle()
+            style.setMediaSession(self._media_session.getSessionToken())
+            style.setShowActionsInCompactView([0, 1, 2])
+            builder.setStyle(style)
+            self._manager.notify(7401, builder.build())
+        except Exception:
+            # Notification support is best-effort on Android versions that restrict media UI.
+            pass
+
+    def handle_media_intent(self):
+        if platform != "android":
+            return
+        try:
+            intent = get_activity().getIntent()
+            action = intent.getStringExtra("dced_media_action")
+            if not action:
+                return
+            intent.removeExtra("dced_media_action")
+            if action == "toggle":
+                self.toggle()
+            elif action == "next":
+                self.go_next()
+            elif action == "previous":
+                self.go_prev()
+        except Exception:
+            pass
 
     def on_pause(self):
         return True
 
     def on_resume(self):
+        self.handle_media_intent()
         if not self.songs:
             self.rescan()
 
     def on_stop(self):
         self.engine.release()
+        try:
+            if getattr(self, "_manager", None):
+                self._manager.cancel(7401)
+            if self._media_session:
+                self._media_session.setActive(False)
+                self._media_session.release()
+        except Exception:
+            pass
 
     def on_key(self, win, key, *a):
         if key == 27:
@@ -1407,24 +1626,6 @@ class GlassApp(App):
             self.songs = list(SONGS)
         self.refresh()
         self.toast("%d songs found" % n)
-        if first and n == 0 and platform == "android":
-            self.ask_all_files()
-
-    def ask_all_files(self):
-        try:
-            from jnius import autoclass
-            if autoclass("android.os.Build$VERSION").SDK_INT >= 30:
-                Env = autoclass("android.os.Environment")
-                if not Env.isExternalStorageManager():
-                    Intent = autoclass("android.content.Intent")
-                    Settings = autoclass("android.provider.Settings")
-                    Uri = autoclass("android.net.Uri")
-                    act = get_activity()
-                    act.startActivity(Intent(
-                        Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
-                        Uri.parse("package:" + act.getPackageName())))
-        except Exception:
-            pass
 
     def set_query(self, text):
         self.q = text.strip().lower()
@@ -1491,14 +1692,14 @@ class GlassApp(App):
         self.set_hue(self.cur_hue)
         self.mini.ids.cov.set_cover(s["path"], 160)
         path = s["path"]
-        self.stage_cov.set_cover(path, 640, lambda tex, h: h is not None and
-                                 self.cur_path == path and self.set_hue(h))
         self.frac, self.t0 = 0, "0:00"
         self.mark_current()
         if self.engine.play(path):
             self.playing = True
+            self.update_media_notification()
         else:
             self.playing = False
+            self.update_media_notification()
             self.fail()
 
     def fail(self):
@@ -1521,6 +1722,7 @@ class GlassApp(App):
             self.go_next()
         else:
             self.playing = False
+        self.update_media_notification()
 
     def go_next(self, *a):
         if not self.view:
@@ -1546,6 +1748,7 @@ class GlassApp(App):
         else:
             self.engine.resume()
         self.playing = self.engine.playing()
+        self.update_media_notification()
 
     def toggle_shuffle(self):
         self.shuffle = not self.shuffle
@@ -1567,6 +1770,9 @@ class GlassApp(App):
                     self.sk.value = self.frac * 1000
                     self.t0 = fmt(pos)
                 self.t1 = fmt(d)
+        if self.t - self._last_notification_update >= 1.2:
+            self._last_notification_update = self.t
+            self.update_media_notification()
         opened = self.sheet.opened
         if self.playing:
             if not opened:
@@ -1582,7 +1788,6 @@ class GlassApp(App):
         if opened or self.sheet.y > -self.sheet.height * .98:
             if self.playing:
                 self.ang = (self.ang + dt * 72) % 360
-                self.disc.ang = self.ang
             self.bass = sum(self.bars[19:25]) / 6.0
             if self.playing or max(self.bars) > .01:
                 self.viz.draw()
