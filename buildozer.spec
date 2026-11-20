@@ -12,6 +12,8 @@ fullscreen = 0
 android.permissions = READ_EXTERNAL_STORAGE,READ_MEDIA_AUDIO,MANAGE_EXTERNAL_STORAGE,WAKE_LOCK
 android.api = 33
 android.minapi = 24
+android.ndk = 25b
+p4a.branch = v2024.01.21
 android.archs = arm64-v8a
 android.accept_sdk_license = True
 
