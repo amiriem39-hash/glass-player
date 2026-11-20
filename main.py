@@ -853,6 +853,7 @@ class Sheet(FloatLayout):
 
     def __init__(self, **kw):
         super().__init__(**kw)
+        self.opacity = 0
         self.bind(height=self._h)
 
     def _h(self, *a):
@@ -861,13 +862,16 @@ class Sheet(FloatLayout):
 
     def show(self):
         self.opened = True
+        self.opacity = 1
         Animation.cancel_all(self, "y")
         Animation(y=0, d=.45, t="out_cubic").start(self)
 
     def hide(self):
         self.opened = False
         Animation.cancel_all(self, "y")
-        Animation(y=-self.height * 1.05, d=.35, t="in_cubic").start(self)
+        a = Animation(y=-self.height * 1.05, d=.35, t="in_cubic")
+        a.bind(on_complete=lambda *x: None if self.opened else setattr(self, "opacity", 0))
+        a.start(self)
 
     def on_touch_down(self, t):
         return super().on_touch_down(t) or (self.opened and self.collide_point(*t.pos))
@@ -1071,6 +1075,8 @@ KV = r'''
         pos_hint: {'x': .19, 'y': .06}
     FloatLayout:
         id: art
+        size_hint: .8, .8
+        pos_hint: {'x': 0, 'y': .1}
         canvas.before:
             PushMatrix
             Rotate:
