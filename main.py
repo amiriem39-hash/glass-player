@@ -32,7 +32,7 @@ from kivy.graphics import (Translate, Color, Ellipse, Line, PopMatrix, PushMatri
                            Mesh, Rectangle, Rotate, RoundedRectangle, Triangle)
 from kivy.graphics.texture import Texture
 from kivy.lang import Builder
-from kivy.metrics import dp
+from kivy.metrics import dp, sp
 from kivy.properties import (BooleanProperty, ListProperty, NumericProperty,
                              StringProperty, ObjectProperty)
 from kivy.uix.behaviors import ButtonBehavior
