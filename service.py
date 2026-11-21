@@ -236,9 +236,7 @@ class Notifier:
                 pb.setState(3 if playing else 2, pos, 1.0 if playing else 0.0)
                 sh_i, rp_i = self.mode_icons()
                 for name, label, icon in (
-                        ("shuffle", "Shuffle", sh_i),
-                        ("repeat", "Repeat", rp_i),
-                        ("close", "Close", RD.ic_menu_close_clear_cancel)):
+                        ("close", "Close", RD.ic_menu_close_clear_cancel),):
                     try:
                         pb.addCustomAction(name, label, icon)
                     except Exception:
@@ -286,20 +284,16 @@ class Notifier:
         if bmp is not None:
             b.setLargeIcon(bmp)
         if media:
-            sh_i, rp_i = self.mode_icons()
-            c = self.core
-            b.addAction(sh_i, "Shuffle on" if c.shuffle else "Shuffle off", pending("SHUFFLE", 15))
             b.addAction(RD.ic_media_previous, "Previous", pending("PREV", 11))
             b.addAction(RD.ic_media_pause if playing else RD.ic_media_play,
                         "Pause" if playing else "Play", pending("TOGGLE", 12))
             b.addAction(RD.ic_media_next, "Next", pending("NEXT", 13))
-            b.addAction(rp_i, ("Repeat off", "Repeat all", "Repeat one")[c.repeat % 3],
-                        pending("REPEAT", 16))
+            b.addAction(RD.ic_menu_close_clear_cancel, "Close", pending("CLOSE", 14))
             if self.session is not None:
                 MediaStyle = autoclass("android.app.Notification$MediaStyle")
                 style = MediaStyle()
                 style.setMediaSession(self.session.getSessionToken())
-                style.setShowActionsInCompactView([1, 2, 3])
+                style.setShowActionsInCompactView([0, 1, 2])
                 b.setStyle(style)
         svc.startForeground(NOTIF_ID, b.build())   # (re)posts it as the service's notification
         self.fg = True

@@ -1110,14 +1110,16 @@ class Stage(Widget):
         self.t, self.bass_v = t, bass
         goal = 0.0 if self.touching else (1.0 if playing else .55)
         self.amp += (goal - self.amp) * min(1.0, dt * 3)
-        ax_ = (math.sin(t * .9) * .60 + math.sin(t * .37 + 1.3) * .28) * self.amp
-        ay_ = (math.cos(t * .71) * .42 + math.sin(t * .29 + .5) * .20) * self.amp
+        ap = App.get_running_app()
+        ax_ = (math.sin(t * .9) * .60 + math.sin(t * .37 + 1.3) * .28) * self.amp * ap.sway
+        ay_ = (math.cos(t * .71) * .42 + math.sin(t * .29 + .5) * .20) * self.amp * ap.sway
         d = math.exp(-dt * 2.4)
         self.kx = max(-1.0, min(1.0, (self.kx - wy * dt * .9) * d))     # phone rolled left/right
         self.ky = max(-1.0, min(1.0, (self.ky + wx * dt * .9) * d))     # phone pitched
         self.kr = max(-14.0, min(14.0, (self.kr - wz * dt * 40) * math.exp(-dt * 2.0)))  # spun
-        self.px = max(-1.0, min(1.0, ax_ + sx + self.kx + self.tx))
-        self.py = max(-1.0, min(1.0, ay_ + sy + self.ky + self.ty))
+        k3 = ap.fx3d
+        self.px = max(-1.0, min(1.0, (ax_ + sx + self.kx + self.tx) * k3))
+        self.py = max(-1.0, min(1.0, (ay_ + sy + self.ky + self.ty) * k3))
         self.redraw()
 
     def redraw(self):
@@ -1410,8 +1412,8 @@ KV = r'''
     height: dp(78)
     padding: dp(10)
     spacing: dp(12)
-    rad: dp(22)
-    fill: .09
+    rad: dp(app.rad_row)
+    fill: app.row_fill
     on_release: app.row_tap(self)
     canvas.after:
         Color:
@@ -1478,10 +1480,22 @@ KV = r'''
 
 <Mini>:
     rad: dp(26)
-    fill: .13
+    fill: .06
     padding: dp(9), dp(9), dp(12), dp(9)
     spacing: dp(12)
+    canvas.before:
+        Color:
+            rgba: .06, .04, .13, app.mini_op
+        RoundedRectangle:
+            pos: self.pos
+            size: self.size
+            radius: [self.rad]
     canvas.after:
+        Color:
+            rgba: 1, 1, 1, .2
+        Line:
+            rounded_rectangle: (self.x, self.y, self.width, self.height, self.rad)
+            width: 1
         Color:
             rgba: 1, 1, 1, .14
         RoundedRectangle:
@@ -1552,6 +1566,7 @@ KV = r'''
                 id: viz
                 size_hint_y: None
                 height: dp(78)
+                opacity: 1 if app.viz_on else 0
             Stage:
                 id: stage
                 size_hint: 1, 1
@@ -1666,7 +1681,7 @@ KV = r'''
                 size_hint: None, None
                 size: dp(46), dp(46)
                 pos_hint: {'center_x': .5}
-                on_release: app.open_more()
+                on_release: app.open_more(self)
             GBtn:
                 kind: 'list'
                 isz: .55
@@ -1884,6 +1899,7 @@ KV = r'''
 
 # ------------------------------------------------------------ app
 DEL_REQ = 7311
+APP_VERSION = "1.4"
 
 
 def prep(s):
@@ -1919,6 +1935,20 @@ class GlassApp(App):
     sel_mode = BooleanProperty(False)
     sel_text = StringProperty("")
     tilt_on = BooleanProperty(True)
+    theme_auto = BooleanProperty(True)
+    accent_hue = NumericProperty(260)
+    row_fill = NumericProperty(.09)
+    mini_op = NumericProperty(.88)
+    rad_row = NumericProperty(22)
+    fx3d = NumericProperty(1.0)
+    sway = NumericProperty(1.0)
+    viz_on = BooleanProperty(True)
+    flip = BooleanProperty(True)
+    SKEYS = ("tilt_on", "theme_auto", "accent_hue", "row_fill", "mini_op",
+             "rad_row", "fx3d", "sway", "viz_on", "flip")
+    DEFAULTS = dict(tilt_on=True, theme_auto=True, accent_hue=260, row_fill=.09,
+                    mini_op=.88, rad_row=22, fx3d=1.0, sway=1.0, viz_on=True, flip=True)
+    EQ_DEF = {"c": "eq", "on": False, "bands": [0, 0, 0, 0, 0], "bass": 0, "virt": 0, "loud": 0}
 
     def goto_playlist(self):
         try:
@@ -1949,27 +1979,266 @@ class GlassApp(App):
         mv.add_widget(box)
         mv.open()
 
-    def open_more(self):
-        self._menu("More", [
-            ("Rescan music", lambda: self.rescan(False, True)),
-            ("Select songs", lambda: (self.sheet.hide(), self.toggle_sel(self.cur_path, True) if self.cur_path else None)),
-            ("Close", lambda: None)])
+    # ---- persistent settings
+    def _sfile(self):
+        return os.path.join(pc.data_dir(), "settings.json")
 
+    def load_settings(self):
+        self.eq = dict(self.EQ_DEF)
+        try:
+            with open(self._sfile(), encoding="utf-8") as f:
+                d = json.load(f)
+            for k in self.SKEYS:
+                if k in d:
+                    setattr(self, k, d[k])
+            if isinstance(d.get("eq"), dict):
+                self.eq.update(d["eq"])
+        except Exception:
+            pass
+
+    def save_settings(self):
+        d = {k: getattr(self, k) for k in self.SKEYS}
+        d["eq"] = self.eq
+        _write_json(self._sfile(), d)
+
+    def pset(self, k, v):
+        setattr(self, k, v)
+        self.save_settings()
+        if k in ("accent_hue", "theme_auto"):
+            self.set_hue(self.hue)
+        elif k == "flip":
+            self._apply_flip()
+        elif k == "tilt_on":
+            self.tilt_enable(self.tilt_on and self.sheet.opened)
+
+    def _apply_flip(self):
+        st = self.stage
+        st.uv = [(x * .5 + .5, (.5 - y * .5) if self.flip else (y * .5 + .5))
+                 for x, y in st.base]
+
+    def _dark(self, w, r=24):
+        with w.canvas.before:
+            Color(.08, .06, .16, .97)
+            rr = RoundedRectangle(radius=[dp(r)])
+        w.bind(pos=lambda o, v: setattr(rr, "pos", v),
+               size=lambda o, v: setattr(rr, "size", v))
+
+    # ---- three-dots: small box next to the button
+    def open_more(self, btn):
+        wx, wy = btn.to_window(*btn.pos)
+        ov = FloatLayout()
+        box = BoxLayout(size_hint=(None, None), size=(dp(150), dp(58)), padding=dp(5))
+        self._dark(box, 18)
+        box.pos = (wx - dp(158), wy + btn.height / 2 - dp(29))
+        b = TxtBtn(text="Equalizer")
+        b.bgc = [1, 1, 1, .1]
+        b.height = dp(48)
+        box.add_widget(b)
+        ov.add_widget(box)
+        close = lambda *a: Window.remove_widget(ov)
+        b.bind(on_release=lambda *a: (close(), self.open_eq()))
+        ov.bind(on_touch_down=lambda w, t: (close(), True)[1] if not box.collide_point(*t.pos) else False)
+        Window.add_widget(ov)
+
+    # ---- equalizer
+    def eq_changed(self):
+        self.save_settings()
+        _write_json(os.path.join(pc.data_dir(), "eq.json"), self.eq)
+        Clock.unschedule(self._eq_send)
+        Clock.schedule_once(self._eq_send, .2)
+
+    def _eq_send(self, dt):
+        self.remote.send(dict(self.eq), start=self.eq.get("on", False))
+
+    def open_eq(self):
+        eq = self.eq
+        mv = ModalView(size_hint=(.94, .86), background="", background_color=(0, 0, 0, 0),
+                       overlay_color=(0, 0, 0, .7))
+        root = BoxLayout(orientation="vertical", padding=dp(16), spacing=dp(10))
+        self._dark(root, 26)
+        head = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(8))
+        head.add_widget(Label(text="Equalizer", font_size=sp(20), halign="left",
+                              valign="middle"))
+        onb = TxtBtn(text="ON" if eq["on"] else "OFF", size_hint_x=None, width=dp(84))
+        onb.bgc = list(self.c1[:3]) + [.8] if eq["on"] else [1, 1, 1, .12]
+
+        def tog(*a):
+            eq["on"] = not eq["on"]
+            onb.text = "ON" if eq["on"] else "OFF"
+            onb.bgc = list(self.c1[:3]) + [.8] if eq["on"] else [1, 1, 1, .12]
+            self.eq_changed()
+        onb.bind(on_release=tog)
+        head.add_widget(onb)
+        root.add_widget(head)
+        sliders = []
+
+        def bset(i, v):
+            eq["bands"][i] = round(v, 1)
+            self.eq_changed()
+        row = BoxLayout(spacing=dp(6))
+        for i, nm in enumerate(("60", "230", "910", "3.6k", "14k")):
+            col = BoxLayout(orientation="vertical", spacing=dp(4))
+            lv = Label(text="%+.0f" % eq["bands"][i], font_size=sp(12), size_hint_y=None,
+                       height=dp(20), color=(1, 1, 1, .75))
+            sl = Slider(orientation="vertical", min=-12, max=12, value=eq["bands"][i],
+                        value_track=True, value_track_color=self.c2, cursor_size=(dp(22), dp(22)))
+            sl.bind(value=lambda w, v, i=i, lv=lv: (bset(i, v), setattr(lv, "text", "%+.0f" % v)))
+            sliders.append((sl, lv))
+            col.add_widget(lv)
+            col.add_widget(sl)
+            col.add_widget(Label(text=nm, font_size=sp(12), size_hint_y=None, height=dp(20),
+                                 color=(1, 1, 1, .6)))
+            row.add_widget(col)
+        root.add_widget(row)
+        pr = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(6))
+        for nm, vals in (("Flat", [0, 0, 0, 0, 0]), ("Bass", [7, 5, 0, -1, -2]),
+                         ("Pop", [-1, 2, 4, 2, -1]), ("Rock", [5, 3, -2, 3, 5]),
+                         ("Vocal", [-3, -1, 4, 3, -1])):
+            pb = TxtBtn(text=nm, font_size=sp(13))
+            pb.height = dp(44)
+            pb.bgc = [1, 1, 1, .1]
+
+            def ap(w, v=vals):
+                eq["on"] = True
+                onb.text, onb.bgc = "ON", list(self.c1[:3]) + [.8]
+                for (sl, lv), x in zip(sliders, v):
+                    sl.value = x
+            pb.bind(on_release=ap)
+            pr.add_widget(pb)
+        root.add_widget(pr)
+        for nm, key, mx in (("Bass boost", "bass", 1000), ("3D surround", "virt", 1000),
+                            ("Loudness", "loud", 1500)):
+            r = BoxLayout(size_hint_y=None, height=dp(40), spacing=dp(8))
+            r.add_widget(Label(text=nm, font_size=sp(14), size_hint_x=None, width=dp(96),
+                               halign="left", valign="middle", text_size=(dp(96), dp(40))))
+            sl = Slider(min=0, max=mx, value=eq[key], value_track=True,
+                        value_track_color=self.c2, cursor_size=(dp(22), dp(22)))
+
+            def f(w, v, key=key):
+                eq[key] = int(v)
+                self.eq_changed()
+            sl.bind(value=f)
+            r.add_widget(sl)
+            root.add_widget(r)
+        cb = TxtBtn(text="Done")
+        cb.bgc = [1, 1, 1, .1]
+        cb.bind(on_release=lambda *a: mv.dismiss())
+        root.add_widget(cb)
+        mv.add_widget(root)
+        mv.open()
+
+    # ---- settings page (Personalize / About)
     def open_settings(self):
-        st = self.stage
-        self._menu("Settings", [
-            ("Tilt / spin 3D: " + ("ON" if self.tilt_on else "OFF"), self._toggle_tilt),
-            ("Cover upside-down: " + ("ON" if st.flip else "OFF"), self._toggle_flip),
-            ("Close", lambda: None)])
+        mv = ModalView(size_hint=(1, 1), background="", background_color=(0, 0, 0, 0),
+                       overlay_color=(.03, .024, .07, 1), auto_dismiss=False)
+        root = BoxLayout(orientation="vertical", padding=(dp(14), dp(30), dp(14), dp(12)),
+                         spacing=dp(10))
+        head = BoxLayout(size_hint_y=None, height=dp(48), spacing=dp(10))
+        x = GBtn(kind="close", style="glass", isz=.5, size_hint=(None, None),
+                 size=(dp(44), dp(44)))
+        x.bind(on_release=lambda *a: mv.dismiss())
+        head.add_widget(x)
+        head.add_widget(Label(text="Settings", font_size=sp(22), halign="left",
+                              valign="middle", text_size=(dp(200), dp(48))))
+        root.add_widget(head)
+        tabs = BoxLayout(size_hint_y=None, height=dp(48), spacing=dp(8))
+        t1, t2 = TxtBtn(text="Personalize"), TxtBtn(text="About")
+        tabs.add_widget(t1)
+        tabs.add_widget(t2)
+        root.add_widget(tabs)
+        holder = BoxLayout()
+        root.add_widget(holder)
 
-    def _toggle_tilt(self):
-        self.tilt_on = not self.tilt_on
-        self.tilt_enable(self.tilt_on and self.sheet.opened)
+        def paint(on):
+            t1.bgc = list(self.c1[:3]) + [.75] if on == 1 else [1, 1, 1, .08]
+            t2.bgc = list(self.c1[:3]) + [.75] if on == 2 else [1, 1, 1, .08]
 
-    def _toggle_flip(self):
-        st = self.stage
-        st.flip = not st.flip
-        st.uv = [(x * .5 + .5, (.5 - y * .5) if st.flip else (y * .5 + .5)) for x, y in st.base]
+        def show(n):
+            holder.clear_widgets()
+            paint(n)
+            holder.add_widget(self._pers_view(mv) if n == 1 else self._about_view())
+        t1.bind(on_release=lambda *a: show(1))
+        t2.bind(on_release=lambda *a: show(2))
+        mv.add_widget(root)
+        show(1)
+        mv.open()
+
+    def _pers_view(self, mv):
+        from kivy.uix.scrollview import ScrollView
+        sv = ScrollView(bar_width=dp(3))
+        col = BoxLayout(orientation="vertical", size_hint_y=None, spacing=dp(8),
+                        padding=(0, dp(4), 0, dp(20)))
+        col.bind(minimum_height=col.setter("height"))
+
+        def sec(t):
+            col.add_widget(Label(text=t, font_size=sp(13), color=(1, 1, 1, .55),
+                                 size_hint_y=None, height=dp(28), halign="left",
+                                 text_size=(Window.width - dp(28), dp(28))))
+
+        def tog(label, key):
+            b = TxtBtn()
+            b.bgc = [1, 1, 1, .08]
+
+            def upd():
+                b.text = "%s:  %s" % (label, "ON" if getattr(self, key) else "OFF")
+            upd()
+            b.bind(on_release=lambda *a: (self.pset(key, not getattr(self, key)), upd()))
+            col.add_widget(b)
+
+        def sld(label, key, lo, hi, step=0):
+            r = BoxLayout(size_hint_y=None, height=dp(52), spacing=dp(8), padding=(dp(6), 0))
+            r.add_widget(Label(text=label, font_size=sp(14), size_hint_x=.42, halign="left",
+                               valign="middle", text_size=((Window.width - dp(40)) * .42, dp(52))))
+            sl = Slider(min=lo, max=hi, value=getattr(self, key), step=step,
+                        value_track=True, value_track_color=self.c2,
+                        cursor_size=(dp(22), dp(22)))
+            sl.bind(value=lambda w, v: self.pset(key, v))
+            r.add_widget(sl)
+            col.add_widget(r)
+        sec("COLORS")
+        tog("Colors follow the cover", "theme_auto")
+        sld("Accent color", "accent_hue", 0, 360)
+        sec("LIST AND MINI PLAYER")
+        sld("List transparency", "row_fill", .02, .3)
+        sld("Mini player opacity", "mini_op", .2, 1)
+        sld("Corner roundness", "rad_row", 6, 34)
+        sec("PLAYER")
+        tog("Cover upside-down", "flip")
+        tog("Move with phone tilt", "tilt_on")
+        tog("Equalizer bars", "viz_on")
+        sld("3D strength", "fx3d", 0, 1.6)
+        sld("Cover auto-motion", "sway", 0, 1.5)
+        rb = TxtBtn(text="Reset to default")
+        rb.bgc = [.95, .25, .3, .55]
+
+        def reset(*a):
+            for k, v in self.DEFAULTS.items():
+                setattr(self, k, v)
+            self.save_settings()
+            self.set_hue(self.hue)
+            self._apply_flip()
+            mv.dismiss()
+            self.toast("Reset")
+        rb.bind(on_release=reset)
+        col.add_widget(rb)
+        sv.add_widget(col)
+        return sv
+
+    def _about_view(self):
+        b = BoxLayout(orientation="vertical", spacing=dp(6), padding=dp(10))
+        b.add_widget(Label(text="DCED Plyer", font_name="Display", font_size=sp(32),
+                           size_hint_y=None, height=dp(60)))
+        for k, v in (("Version", APP_VERSION), ("Songs", str(self.nsongs)),
+                     ("Engine", "Android MediaPlayer + AudioFX"),
+                     ("Features", "3D cover, equalizer, notification controls")):
+            r = BoxLayout(size_hint_y=None, height=dp(44))
+            r.add_widget(Label(text=k, color=(1, 1, 1, .6), halign="left", valign="middle",
+                               text_size=(dp(100), dp(44)), size_hint_x=None, width=dp(100)))
+            r.add_widget(Label(text=v, halign="left", valign="middle",
+                               text_size=(Window.width - dp(160), dp(44))))
+            b.add_widget(r)
+        b.add_widget(Widget())
+        return b
 
     def build(self):
         setup_font()
@@ -2001,6 +2270,7 @@ class GlassApp(App):
         self.covers = Covers()
         self.remote = Remote(self)
         Window.bind(on_keyboard=self.on_key)
+        self.load_settings()
         Builder.load_string(KV)
         return Root()
 
@@ -2031,6 +2301,7 @@ class GlassApp(App):
         self.sk = self.sheet.ids.sk
         self.viz = self.sheet.ids.viz
         self.stage = self.sheet.ids.stage
+        self._apply_flip()
         # 1) the saved library is on screen immediately - never an empty list
         cached = load_cache(self.hidden)
         if cached:
@@ -2444,6 +2715,8 @@ class GlassApp(App):
     # ---- theme
     def set_hue(self, h):
         self.hue = h
+        if not self.theme_auto:
+            h = self.accent_hue
         a = colorsys.hls_to_rgb((h % 360) / 360., .55, .8)
         b = colorsys.hls_to_rgb(((h + 70) % 360) / 360., .55, .9)
         Animation(c1=[a[0], a[1], a[2], 1], c2=[b[0], b[1], b[2], 1], d=.8).start(self)

@@ -103,6 +103,61 @@ if ANDROID:
             except Exception:
                 pass
             self._focus = _Focus(self._on_focus)
+            self.cfg = {}
+            self.fx = []
+
+        def set_fx(self, cfg):
+            self.cfg = cfg or {}
+            self._apply_fx()
+
+        def _rel_fx(self):
+            for f in self.fx:
+                try:
+                    f.release()
+                except Exception:
+                    pass
+            self.fx = []
+
+        def _apply_fx(self):
+            self._rel_fx()
+            cfg = self.cfg or {}
+            if not self.mp or not cfg.get("on"):
+                return
+            try:
+                sid = self.mp.getAudioSessionId()
+            except Exception:
+                return
+            import math
+
+            def mk(name, *a):
+                f = autoclass("android.media.audiofx." + name)(*a)
+                f.setEnabled(True)
+                self.fx.append(f)
+                return f
+            try:
+                eq = mk("Equalizer", 0, sid)
+                lo, hi = eq.getBandLevelRange()[0], eq.getBandLevelRange()[1]
+                bands = list(cfg.get("bands") or [0] * 5)[:5]
+                bands += [0] * (5 - len(bands))
+                tg = (60, 230, 910, 3600, 14000)
+                for b in range(eq.getNumberOfBands()):
+                    f = max(1.0, eq.getCenterFreq(b) / 1000.0)
+                    j = min(range(5), key=lambda k: abs(math.log(f / tg[k])))
+                    eq.setBandLevel(b, int(max(lo, min(hi, bands[j] * 100))))
+            except Exception:
+                pass
+            try:
+                mk("BassBoost", 0, sid).setStrength(int(cfg.get("bass", 0)))
+            except Exception:
+                pass
+            try:
+                mk("Virtualizer", 0, sid).setStrength(int(cfg.get("virt", 0)))
+            except Exception:
+                pass
+            try:
+                mk("LoudnessEnhancer", sid).setTargetGain(int(cfg.get("loud", 0)))
+            except Exception:
+                pass
 
         def _on_focus(self, change):
             self.focus_ev = change
@@ -125,6 +180,7 @@ if ANDROID:
                 pass
 
         def release(self):
+            self._rel_fx()
             if self.mp:
                 try:
                     self.mp.release()
@@ -162,6 +218,7 @@ if ANDROID:
                 self.want_focus()
                 mp.start()
                 self.mp = mp
+                self._apply_fx()
                 return True
             except Exception:
                 try:
@@ -207,6 +264,10 @@ else:
             self.ended_gen = self.failed_gen = -1
             self.focus_ev = None
             self._m, self._p = False, 0
+            self.cfg = {}
+
+        def set_fx(self, cfg):
+            self.cfg = cfg or {}
 
         def release(self):
             if self.s:
@@ -267,6 +328,11 @@ else:
 class PlayerCore:
     def __init__(self, ctx=None):
         self.engine = Engine(ctx)
+        try:
+            with open(os.path.join(data_dir(), "eq.json"), encoding="utf-8") as f:
+                self.engine.cfg = json.load(f)
+        except Exception:
+            pass
         self.items, self.lookup = [], {}
         self.idx = -1
         self.cur = None
@@ -320,6 +386,8 @@ class PlayerCore:
             self.dirty = True
         elif c == "stop":
             self.stop()
+        elif c == "eq":
+            self.engine.set_fx(m)
 
     def play_path(self, path, m=None):
         if not path:
