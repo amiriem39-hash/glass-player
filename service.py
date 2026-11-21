@@ -91,7 +91,7 @@ class Notifier:
         try:
             IntentFilter = autoclass("android.content.IntentFilter")
             f = IntentFilter()
-            for a in ("PREV", "TOGGLE", "NEXT", "CLOSE"):
+            for a in ("PREV", "TOGGLE", "NEXT", "CLOSE", "SHUFFLE", "REPEAT"):
                 f.addAction(PKG + "." + a)
             f.addAction("android.media.AUDIO_BECOMING_NOISY")
             self.receiver = autoclass("org.dced.player.ControlReceiver")()
@@ -106,6 +106,24 @@ class Notifier:
             self.notify("DCED Plyer", "", None, False, media=False)
         except Exception:
             log("promote")
+
+    def ic(self, name, fallback):
+        """Own vector icon (res/drawable) if packed in the app, else a system icon."""
+        try:
+            i = ctx.getResources().getIdentifier(name, "drawable", PKG)
+            if i:
+                return i
+        except Exception:
+            pass
+        return fallback
+
+    def mode_icons(self):
+        RD = autoclass("android.R$drawable")
+        c = self.core
+        sh = self.ic("ic_shuffle_on" if c.shuffle else "ic_shuffle_off", RD.ic_menu_rotate)
+        rp = self.ic(("ic_repeat_off", "ic_repeat_all", "ic_repeat_one")[c.repeat % 3],
+                     RD.ic_popup_sync)
+        return sh, rp
 
     # ---- cover art for the notification / lock screen
     def cover(self, it):
@@ -216,10 +234,15 @@ class Notifier:
                 pb = PB()
                 pb.setActions(actions)
                 pb.setState(3 if playing else 2, pos, 1.0 if playing else 0.0)
-                try:
-                    pb.addCustomAction("close", "Close", RD.ic_menu_close_clear_cancel)
-                except Exception:
-                    pass
+                sh_i, rp_i = self.mode_icons()
+                for name, label, icon in (
+                        ("shuffle", "Shuffle", sh_i),
+                        ("repeat", "Repeat", rp_i),
+                        ("close", "Close", RD.ic_menu_close_clear_cancel)):
+                    try:
+                        pb.addCustomAction(name, label, icon)
+                    except Exception:
+                        log("custom action " + name)
                 self.session.setPlaybackState(pb.build())
                 self.session.setActive(True)
             except Exception:
@@ -263,16 +286,20 @@ class Notifier:
         if bmp is not None:
             b.setLargeIcon(bmp)
         if media:
+            sh_i, rp_i = self.mode_icons()
+            c = self.core
+            b.addAction(sh_i, "Shuffle on" if c.shuffle else "Shuffle off", pending("SHUFFLE", 15))
             b.addAction(RD.ic_media_previous, "Previous", pending("PREV", 11))
             b.addAction(RD.ic_media_pause if playing else RD.ic_media_play,
                         "Pause" if playing else "Play", pending("TOGGLE", 12))
             b.addAction(RD.ic_media_next, "Next", pending("NEXT", 13))
-            b.addAction(RD.ic_menu_close_clear_cancel, "Close", pending("CLOSE", 14))
+            b.addAction(rp_i, ("Repeat off", "Repeat all", "Repeat one")[c.repeat % 3],
+                        pending("REPEAT", 16))
             if self.session is not None:
                 MediaStyle = autoclass("android.app.Notification$MediaStyle")
                 style = MediaStyle()
                 style.setMediaSession(self.session.getSessionToken())
-                style.setShowActionsInCompactView([0, 1, 2])
+                style.setShowActionsInCompactView([1, 2, 3])
                 b.setStyle(style)
         svc.startForeground(NOTIF_ID, b.build())   # (re)posts it as the service's notification
         self.fg = True
@@ -368,6 +395,12 @@ class Service:
         elif s == "prev":
             core.errs = 0
             core.prev()
+        elif s == "shuffle":
+            core.shuffle = not core.shuffle
+            core.dirty = True
+        elif s == "repeat":
+            core.repeat = (core.repeat + 1) % 3
+            core.dirty = True
         elif s == "close":
             self.shutdown()
         elif s.startswith("seek:"):
@@ -383,6 +416,11 @@ class Service:
         if not self.running:
             return
         self.running = False
+        try:
+            self.core.cur = None
+            self.core.save_resume(clean=True)
+        except Exception:
+            pass
         try:
             self.core.engine.stop()
         except Exception:
@@ -401,7 +439,12 @@ class Service:
             log("setup")
         self.bind()
         self.note.promote()
+        try:
+            self.core.load_resume()           # service came back after being killed
+        except Exception:
+            log("resume")
         last_pub = time.time()
+        last_save = 0.0
         while self.running:
             try:
                 r, _, _ = select.select([self.sock], [], [], .1)
@@ -430,6 +473,9 @@ class Service:
                     if self.ui_fg and self.core.seq != seq:
                         self.send_state()
                 now = time.time()
+                if self.core.cur is not None and now - last_save > 3:
+                    last_save = now
+                    self.core.save_resume()
                 if self.core.cur is not None and now - last_pub > 20:
                     last_pub = now
                     self.core.dirty = True       # keep the notification / media card fresh

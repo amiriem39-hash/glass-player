@@ -28,7 +28,7 @@ from kivy.core.image import Image as CoreImage
 from kivy.core.text import DEFAULT_FONT, LabelBase
 from kivy.core.text import Label as CoreLabel
 from kivy.core.window import Window
-from kivy.graphics import (Color, Ellipse, Line, PopMatrix, PushMatrix,
+from kivy.graphics import (Translate, Color, Ellipse, Line, PopMatrix, PushMatrix,
                            Mesh, Rectangle, Rotate, RoundedRectangle, Triangle)
 from kivy.graphics.texture import Texture
 from kivy.lang import Builder
@@ -1240,15 +1240,50 @@ class SongRow(RecycleDataViewBehavior, ButtonBehavior, Glass):
     cur = BooleanProperty(False)
     sel = BooleanProperty(False)
 
+    ox = NumericProperty(0)          # horizontal slide-in offset (scroll animation)
+
     def __init__(self, **kw):
         super().__init__(**kw)
         self.long_fired = False
         self._lp_ev = None
         self._lp_y = 0
+        self._in_ev = None
+        # whole row (background + children) is drawn shifted by `ox`
+        self._tr = Translate(0, 0)
+        self.canvas.before.insert(0, PushMatrix())
+        self.canvas.before.insert(1, self._tr)
+        self.canvas.after.add(PopMatrix())
+        self.bind(ox=lambda w, v: setattr(w._tr, "x", v))
+
+    def _cancel_in(self):
+        if self._in_ev:
+            self._in_ev.cancel()
+            self._in_ev = None
+        Animation.cancel_all(self)
+
+    def _slide_in(self, d, delay):
+        """d=+1: user scrolls down -> row comes from the left; d=-1: from the right."""
+        self._cancel_in()
+        self.opacity = 0
+        self.ox = -d * dp(150)
+
+        def go(dt):
+            self._in_ev = None
+            Animation(ox=0, opacity=1, d=.32, t="out_cubic").start(self)
+        self._in_ev = Clock.schedule_once(go, delay)
 
     def refresh_view_attrs(self, rv, index, data):
+        old = self.idx
         super().refresh_view_attrs(rv, index, data)
         self.ids.cov.set_cover(self.path, 160)
+        app = App.get_running_app()
+        d = app.scroll_anim_dir() if app else 0
+        if d and old != self.idx:
+            self._slide_in(d, app.scroll_anim_delay())
+        elif self.ox or self.opacity < 1:
+            self._cancel_in()
+            self.ox = 0
+            self.opacity = 1
 
     def _cancel_lp(self):
         if self._lp_ev:
@@ -1842,6 +1877,7 @@ class GlassApp(App):
         Window.clearcolor = (.03, .024, .07, 1)
         Window.softinput_mode = "below_target"
         self.songs, self.view, self.q = [], [], ""
+        self._sc_y, self._sc_t, self._sc_dir, self._sc_n = 1.0, 0.0, 1, 0
         self.by_path = {}
         self.selected = set()
         self.hidden = load_hidden()
@@ -1869,9 +1905,30 @@ class GlassApp(App):
         Builder.load_string(KV)
         return Root()
 
+    # ---- list scroll animation: rows slide in one by one (down: from left, up: from right)
+    def _on_rv_scroll(self, rv, y):
+        now = time.time()
+        if abs(y - self._sc_y) > 1e-4:
+            if now - self._sc_t > .25:
+                self._sc_n = 0                       # new gesture: restart the stagger
+            self._sc_dir = 1 if y < self._sc_y else -1   # scroll_y falls = moving down the list
+            self._sc_t = now
+        self._sc_y = y
+
+    def scroll_anim_dir(self):
+        if time.time() - self._sc_t > .12:
+            return 0
+        return self._sc_dir
+
+    def scroll_anim_delay(self):
+        n = self._sc_n
+        self._sc_n += 1
+        return min(n * .045, .22)
+
     def on_start(self):
         ids = self.root.ids
         self.sheet, self.rv, self.mini = ids.sheet, ids.rv, ids.mini
+        self.rv.bind(scroll_y=self._on_rv_scroll)
         self.sk = self.sheet.ids.sk
         self.viz = self.sheet.ids.viz
         self.stage = self.sheet.ids.stage

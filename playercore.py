@@ -11,6 +11,7 @@ This module must NOT import kivy (the service process has no window).
 """
 import json
 import os
+import time
 import random
 
 CMD_PORT = 47811      # UI      -> service   (UDP, localhost)
@@ -31,6 +32,10 @@ def data_dir():
 
 def queue_file():
     return os.path.join(data_dir(), "queue.json")
+
+
+def resume_file():
+    return os.path.join(data_dir(), "resume.json")
 
 
 def hue_of(s):
@@ -287,8 +292,10 @@ class PlayerCore:
         c = m.get("c")
         if "shuffle" in m:
             self.shuffle = bool(m["shuffle"])
+            self.dirty = True
         if "repeat" in m:
             self.repeat = int(m["repeat"])
+            self.dirty = True
         if c == "play":
             if m.get("reload"):
                 self.load_queue()
@@ -416,6 +423,50 @@ class PlayerCore:
                     self.focus_paused = False
                     e.resume()
                     self.dirty = True
+
+    # ---- survive the system killing the service (swipe from recents on some phones)
+    def save_resume(self, clean=False):
+        try:
+            it = self.cur
+            d = {"clean": bool(clean or it is None), "ts": time.time(),
+                 "path": it["path"] if it else "",
+                 "title": it["title"] if it else "", "artist": it["artist"] if it else "",
+                 "pos": self.engine.pos() if it else 0,
+                 "playing": bool(it and self.engine.playing()),
+                 "shuffle": self.shuffle, "repeat": self.repeat}
+            tmp = resume_file() + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(d, f)
+            os.replace(tmp, resume_file())
+        except Exception:
+            pass
+
+    def load_resume(self):
+        """After an unclean kill: bring back the song (and keep playing if it was playing)."""
+        try:
+            with open(resume_file(), encoding="utf-8") as f:
+                d = json.load(f)
+        except Exception:
+            return False
+        try:
+            if d.get("clean") or not d.get("path") or not os.path.isfile(d["path"]):
+                return False
+            self.shuffle = bool(d.get("shuffle"))
+            self.repeat = int(d.get("repeat", 0))
+            self.load_queue()
+            if not self.items:
+                self.items = []
+            self.play_path(d["path"], d)
+            pos = float(d.get("pos", 0))
+            if pos > 1:
+                self.engine.seek(pos)
+            fresh = time.time() - float(d.get("ts", 0)) < 120
+            if not (d.get("playing") and fresh):
+                self.engine.pause()
+            self.dirty = True
+            return True
+        except Exception:
+            return False
 
     def _on_end(self):
         if self.repeat == 2:

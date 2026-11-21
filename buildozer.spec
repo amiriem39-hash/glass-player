@@ -4,8 +4,9 @@ package.name = glassplayer
 package.domain = org.glass
 source.dir = .
 source.include_exts = py,ttf,png,jpg
-source.exclude_dirs = .github,bin,java,blocks
-version = 1.2
+source.exclude_dirs = .github,bin,java,blocks,res,p4a_keys
+source.exclude_patterns = p4a_hook.py
+version = 1.3
 icon.filename = %(source.dir)s/icon.png
 presplash.filename = %(source.dir)s/presplash.png
 android.presplash_color = #08061A
@@ -24,6 +25,10 @@ android.accept_sdk_license = True
 services = player:service.py:foreground:sticky
 # Java helpers for the media session / notification buttons
 android.add_src = java
+# notification icons (shuffle / repeat)
+android.add_resources = res/drawable/ic_shuffle_on.xml:drawable/ic_shuffle_on.xml,res/drawable/ic_shuffle_off.xml:drawable/ic_shuffle_off.xml,res/drawable/ic_repeat_off.xml:drawable/ic_repeat_off.xml,res/drawable/ic_repeat_all.xml:drawable/ic_repeat_all.xml,res/drawable/ic_repeat_one.xml:drawable/ic_repeat_one.xml
+# same signing key on every build -> new APK installs over the old one
+p4a.hook = p4a_hook.py
 
 [buildozer]
 log_level = 2
