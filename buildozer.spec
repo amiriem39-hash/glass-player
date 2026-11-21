@@ -1,5 +1,5 @@
 [app]
-title = DCED Plyer
+title = MPDG Player
 package.name = glassplayer
 package.domain = org.glass
 source.dir = .
