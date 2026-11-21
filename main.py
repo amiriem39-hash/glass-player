@@ -715,6 +715,23 @@ def draw_icon(k, cx, cy, sz, col):
         L((7.5, 13.5), (4.5, 16), (7.5, 18.5))
         if k == "repeat1":
             L((10.8, 11), (12.5, 10), (12.5, 14))
+    elif k == "dots":
+        for yy in (5.5, 12, 18.5):
+            Ellipse(pos=(X(12) - 1.9 * u, Y(yy) - 1.9 * u), size=(3.8 * u, 3.8 * u))
+    elif k == "list":
+        L((8, 6), (20, 6))
+        L((8, 12), (20, 12))
+        L((8, 18), (20, 18))
+        Ellipse(pos=(X(4.6) - 1.3 * u, Y(6) - 1.3 * u), size=(2.6 * u, 2.6 * u))
+        Ellipse(pos=(X(4.6) - 1.3 * u, Y(12) - 1.3 * u), size=(2.6 * u, 2.6 * u))
+        Ellipse(pos=(X(4.6) - 1.3 * u, Y(18) - 1.3 * u), size=(2.6 * u, 2.6 * u))
+    elif k == "gear":
+        Line(circle=(cx, cy, 7.2 * u), width=w)
+        Line(circle=(cx, cy, 2.6 * u), width=w)
+        for i in range(8):
+            a = math.radians(i * 45)
+            L((12 + 7.2 * math.cos(a), 12 + 7.2 * math.sin(a)),
+              (12 + 9.8 * math.cos(a), 12 + 9.8 * math.sin(a)))
     elif k == "close":
         L((6, 6), (18, 18))
         L((18, 6), (6, 18))
@@ -1022,6 +1039,7 @@ class Stage(Widget):
     path = StringProperty("")
     texture = ObjectProperty(None, allownone=True)
     bg = ListProperty([.6, .2, .8, 1])
+    flip = BooleanProperty(True)
 
     def __init__(self, **kw):
         super().__init__(**kw)
@@ -1033,7 +1051,7 @@ class Stage(Widget):
         self._ltex = None
         self._lkey = None
         self.base, idx, self.N = ring_template()
-        self.uv = [(x * .5 + .5, y * .5 + .5) for x, y in self.base]
+        self.uv = [(x * .5 + .5, .5 - y * .5) for x, y in self.base]   # upside-down art
         zeros = [0.0] * (4 * len(self.base))
         t = Texture.create(size=(64, 1), colorfmt="rgba")
         buf = bytearray()
@@ -1112,7 +1130,7 @@ class Stage(Widget):
         bass = self.bass_v
         zpush = (.02 + bass * .12 + math.sin(self.t * .8) * .012
                  - (abs(self.px) + abs(self.py)) * .04) * S
-        proj = make_proj(cx, cy, S, math.radians(self.px * 22), math.radians(-self.py * 17),
+        proj = make_proj(cx, cy, S, math.radians(self.px * 30), math.radians(-self.py * 24),
                          math.radians(self.kr), zpush)
         tex, bg = self.texture, self.bg
 
@@ -1133,7 +1151,7 @@ class Stage(Widget):
         # back picture (deeper layer -> moves more)
         self.back_c.rgba = (1, 1, 1, .34) if tex else (bg[0], bg[1], bg[2], .30)
         self.back.texture = tex
-        self.back.vertices = verts(1.2, -.45 * S)
+        self.back.vertices = verts(1.28, -.6 * S)
         # cover
         self.cov_c.rgba = (1, 1, 1, 1) if tex else tuple(bg)
         self.cov.texture = tex
@@ -1206,7 +1224,7 @@ class Sheet(FloatLayout):
 
     def show(self):
         self.opened = True
-        App.get_running_app().tilt_enable(True)
+        a_ = App.get_running_app(); a_.tilt_enable(a_.tilt_on)
         self.opacity = 1
         Animation.cancel_all(self, "y")
         Animation(y=0, d=.45, t="out_cubic").start(self)
@@ -1525,125 +1543,154 @@ KV = r'''
                 size: self.size
     BoxLayout:
         pos_hint: {'x': 0, 'y': 0}
-        orientation: 'vertical'
-        padding: dp(22), dp(10), dp(22), dp(18)
+        padding: dp(14), dp(28), dp(8), dp(14)
         spacing: dp(8)
         BoxLayout:
-            size_hint_y: None
-            height: dp(48)
-            GBtn:
-                kind: 'down'
-                style: 'glass'
-                size_hint: None, None
-                size: dp(44), dp(44)
-                on_release: root.hide()
-            Widget:
-        Stage:
-            id: stage
-            size_hint: None, None
-            size: [min(root.width * .7, root.height * .34, dp(320))] * 2
-            pos_hint: {'center_x': .5}
-            hue: app.cur_hue
-            letter: app.cur_letter
-        Label:
-            text: app.cur_title
-            font_size: sp(24)
-            size_hint_y: None
-            height: dp(70)
-            text_size: self.size
-            halign: 'center'
-            valign: 'middle'
-            max_lines: 2
-        Label:
-            text: app.cur_artist
-            font_size: sp(15)
-            color: 1, 1, 1, .7
-            size_hint_y: None
-            height: dp(26)
-            text_size: self.size
-            halign: 'center'
-            valign: 'middle'
-            shorten: True
-        Viz:
-            id: viz
-            size_hint_y: None
-            height: dp(64)
-        BoxLayout:
-            size_hint_y: None
-            height: dp(36)
-            spacing: dp(8)
-            Label:
-                text: app.t0
-                font_size: sp(12)
-                color: 1, 1, 1, .7
-                size_hint_x: None
-                width: dp(40)
-            Seek:
-                id: sk
-                min: 0
-                max: 1000
-                value: 0
-                cursor_size: dp(20), dp(20)
-                value_track: True
-                value_track_color: app.c2
-                value_track_width: dp(4)
-            Label:
-                text: app.t1
-                font_size: sp(12)
-                color: 1, 1, 1, .7
-                size_hint_x: None
-                width: dp(40)
-        Widget:
-        BoxLayout:
-            size_hint_y: None
-            height: dp(108)
+            orientation: 'vertical'
             spacing: dp(6)
-            Widget:
-            GBtn:
-                kind: 'shuffle'
-                active: app.shuffle
-                isz: .56
-                size_hint: None, None
-                size: dp(42), dp(42)
-                pos_hint: {'center_y': .5}
-                on_release: app.toggle_shuffle()
-            GBtn:
-                kind: 'prev'
-                style: 'glass'
-                isz: .46
-                size_hint: None, None
-                size: dp(56), dp(56)
-                pos_hint: {'center_y': .5}
-                on_release: app.go_prev()
-            Orb:
-                frac: app.frac
-                size_hint: None, None
-                size: dp(104), dp(104)
-                pos_hint: {'center_y': .5}
-                GBtn:
-                    kind: 'pause' if app.playing else 'play'
-                    style: 'accent'
-                    isz: .42
-                    size_hint: .78, .78
-                    pos_hint: {'center_x': .5, 'center_y': .5}
-                    on_release: app.toggle()
+            Viz:
+                id: viz
+                size_hint_y: None
+                height: dp(78)
+            Stage:
+                id: stage
+                size_hint: 1, 1
+                hue: app.cur_hue
+                letter: app.cur_letter
+            Label:
+                text: app.cur_title
+                font_size: sp(21)
+                size_hint_y: None
+                height: dp(34)
+                text_size: self.size
+                halign: 'center'
+                valign: 'middle'
+                shorten: True
+            Label:
+                text: app.cur_artist
+                font_size: sp(14)
+                color: 1, 1, 1, .7
+                size_hint_y: None
+                height: dp(22)
+                text_size: self.size
+                halign: 'center'
+                valign: 'middle'
+                shorten: True
+            BoxLayout:
+                size_hint_y: None
+                height: dp(40)
+                spacing: dp(6)
+                Label:
+                    text: app.t0
+                    font_size: sp(12)
+                    color: 1, 1, 1, .7
+                    size_hint_x: None
+                    width: dp(40)
+                Seek:
+                    id: sk
+                    min: 0
+                    max: 1000
+                    value: 0
+                    cursor_size: dp(20), dp(20)
+                    value_track: True
+                    value_track_color: app.c2
+                    value_track_width: dp(4)
+                Label:
+                    text: app.t1
+                    font_size: sp(12)
+                    color: 1, 1, 1, .7
+                    size_hint_x: None
+                    width: dp(40)
+        BoxLayout:
+            orientation: 'vertical'
+            size_hint_x: None
+            width: dp(58)
+            spacing: dp(4)
+            canvas.before:
+                Color:
+                    rgba: 1, 1, 1, .08
+                RoundedRectangle:
+                    pos: self.pos
+                    size: self.size
+                    radius: [dp(22)]
+                Color:
+                    rgba: 1, 1, 1, .2
+                Line:
+                    rounded_rectangle: (self.x, self.y, self.width, self.height, dp(22))
+                    width: 1
             GBtn:
                 kind: 'next'
                 style: 'glass'
+                isz: .5
+                size_hint: None, None
+                size: dp(46), dp(46)
+                pos_hint: {'center_x': .5}
+                on_release: app.go_next()
+            GBtn:
+                kind: 'pause' if app.playing else 'play'
+                style: 'accent'
                 isz: .46
                 size_hint: None, None
-                size: dp(56), dp(56)
-                pos_hint: {'center_y': .5}
-                on_release: app.go_next()
+                size: dp(50), dp(50)
+                pos_hint: {'center_x': .5}
+                on_release: app.toggle()
+            GBtn:
+                kind: 'prev'
+                style: 'glass'
+                isz: .5
+                size_hint: None, None
+                size: dp(46), dp(46)
+                pos_hint: {'center_x': .5}
+                on_release: app.go_prev()
             GBtn:
                 kind: 'repeat1' if app.repeat == 2 else 'repeat'
                 active: app.repeat > 0
-                isz: .56
+                isz: .6
                 size_hint: None, None
-                size: dp(42), dp(42)
-                pos_hint: {'center_y': .5}
+                size: dp(46), dp(46)
+                pos_hint: {'center_x': .5}
                 on_release: app.cycle_repeat()
+            GBtn:
+                kind: 'shuffle'
+                active: app.shuffle
+                isz: .6
+                size_hint: None, None
+                size: dp(46), dp(46)
+                pos_hint: {'center_x': .5}
+                on_release: app.toggle_shuffle()
             Widget:
+            GBtn:
+                kind: 'dots'
+                isz: .55
+                active: True
+                size_hint: None, None
+                size: dp(46), dp(46)
+                pos_hint: {'center_x': .5}
+                on_release: app.open_more()
+            GBtn:
+                kind: 'list'
+                isz: .55
+                active: True
+                size_hint: None, None
+                size: dp(46), dp(46)
+                pos_hint: {'center_x': .5}
+                on_release: root.hide(); app.goto_playlist()
+            GBtn:
+                kind: 'gear'
+                isz: .55
+                active: True
+                size_hint: None, None
+                size: dp(46), dp(46)
+                pos_hint: {'center_x': .5}
+                on_release: app.open_settings()
+            GBtn:
+                kind: 'down'
+                isz: .55
+                active: True
+                size_hint: None, None
+                size: dp(46), dp(46)
+                pos_hint: {'center_x': .5}
+                on_release: root.hide()
 
 <Root>:
     Backdrop:
@@ -1871,6 +1918,58 @@ class GlassApp(App):
     bass = NumericProperty(0)
     sel_mode = BooleanProperty(False)
     sel_text = StringProperty("")
+    tilt_on = BooleanProperty(True)
+
+    def goto_playlist(self):
+        try:
+            i = self.cur_idx()
+            n = max(1, len(self.view) - 1)
+            if i is not None and i >= 0:
+                self.rv.scroll_y = max(0.0, min(1.0, 1.0 - i / float(n)))
+        except Exception:
+            pass
+
+    def _menu(self, title, items):
+        from kivy.uix.modalview import ModalView
+        mv = ModalView(size_hint=(.82, None), height=dp(64 + 56 * len(items)),
+                       background="", background_color=(0, 0, 0, 0),
+                       overlay_color=(0, 0, 0, .6))
+        box = BoxLayout(orientation="vertical", padding=dp(16), spacing=dp(8))
+        with box.canvas.before:
+            Color(.08, .06, .16, .97)
+            rr = RoundedRectangle(radius=[dp(24)])
+        box.bind(pos=lambda w, v: setattr(rr, "pos", v),
+                 size=lambda w, v: setattr(rr, "size", v))
+        box.add_widget(Label(text=title, font_size=sp(18), size_hint_y=None, height=dp(30)))
+        for txt, fn in items:
+            b = TxtBtn(text=txt)
+            b.bgc = [1, 1, 1, .08]
+            b.bind(on_release=lambda w, f=fn: (mv.dismiss(), f()))
+            box.add_widget(b)
+        mv.add_widget(box)
+        mv.open()
+
+    def open_more(self):
+        self._menu("More", [
+            ("Rescan music", lambda: self.rescan(False, True)),
+            ("Select songs", lambda: (self.sheet.hide(), self.toggle_sel(self.cur_path, True) if self.cur_path else None)),
+            ("Close", lambda: None)])
+
+    def open_settings(self):
+        st = self.stage
+        self._menu("Settings", [
+            ("Tilt / spin 3D: " + ("ON" if self.tilt_on else "OFF"), self._toggle_tilt),
+            ("Cover upside-down: " + ("ON" if st.flip else "OFF"), self._toggle_flip),
+            ("Close", lambda: None)])
+
+    def _toggle_tilt(self):
+        self.tilt_on = not self.tilt_on
+        self.tilt_enable(self.tilt_on and self.sheet.opened)
+
+    def _toggle_flip(self):
+        st = self.stage
+        st.flip = not st.flip
+        st.uv = [(x * .5 + .5, (.5 - y * .5) if st.flip else (y * .5 + .5)) for x, y in st.base]
 
     def build(self):
         setup_font()
@@ -2090,7 +2189,7 @@ class GlassApp(App):
         self.remote.last = time.time()
         self.remote.hello()
         if self.sheet.opened:
-            self.tilt_enable(True)
+            self.tilt_enable(self.tilt_on)
         if not self.songs:
             self.rescan()
 
@@ -2385,7 +2484,7 @@ class GlassApp(App):
         self.has_song = True
         self.set_hue(self.cur_hue)
         self.mini.ids.cov.set_cover(s["path"], 160)
-        self.stage.set_cover(s["path"], 400)
+        self.stage.set_cover(s["path"], 640)
         self.frac, self.t0 = 0, "0:00"
         self.mark_current()
 
