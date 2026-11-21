@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-GLASS PLAYER - Kivy (Android)
+MPDG Player - Kivy (Android)
 تبدیل نسخه وب به اپ کیوی. همه‌ی قابلیت‌ها: اسکن آهنگ‌ها، تگ و کاور، جستجو،
 مینی‌پلیر، پلیر تمام‌صفحه، دیسک چرخان، ویژوالایزر، شافل/تکرار، رنگ از روی کاور.
 """
@@ -836,27 +836,56 @@ class CoverBox(FloatLayout):
                 cb(tex, h)
 
 
+def crop_coords(tex, u0, v0, u1, v1):
+    """tex_coords for the sub-rectangle (u0,v0)-(u1,v1) of a texture (bilinear in its own coords)."""
+    tc = tex.tex_coords          # bl, br, tr, tl
+
+    def pt(a, b):
+        x = (tc[0] * (1 - a) * (1 - b) + tc[2] * a * (1 - b) + tc[4] * a * b + tc[6] * (1 - a) * b)
+        y = (tc[1] * (1 - a) * (1 - b) + tc[3] * a * (1 - b) + tc[5] * a * b + tc[7] * (1 - a) * b)
+        return x, y
+    p = (pt(u0, v0), pt(u1, v0), pt(u1, v1), pt(u0, v1))
+    return [c for xy in p for c in xy]
+
+
 class Backdrop(Widget):
+    custom = BooleanProperty(False)     # True only for the song-list screen
+
     def __init__(self, **kw):
         super().__init__(**kw)
-        self.bind(pos=self.draw, size=self.draw)
+        self.bind(pos=self.draw, size=self.draw, custom=self.draw)
         app = App.get_running_app()
-        app.bind(c1=self.draw, c2=self.draw)
+        app.bind(c1=self.draw, c2=self.draw, glow_on=self.draw, bg_tex=self.draw,
+                 bg_dim=self.draw, bg_col=self.draw)
         self.draw()
 
     def draw(self, *a):
         app = App.get_running_app()
         self.canvas.clear()
         m = max(self.size)
+        base = BG_PRESETS[int(app.bg_col) % len(BG_PRESETS)] if self.custom else BG_PRESETS[0]
+        tex = app.bg_tex if self.custom else None
         with self.canvas:
-            Color(.03, .024, .07, 1)
+            Color(base[0], base[1], base[2], 1)
             Rectangle(pos=self.pos, size=self.size)
-            for col, cx, cy in ((app.c1, self.x + self.width * .1, self.top - self.height * .05),
-                                (app.c2, self.right - self.width * .05, self.y + self.height * .05)):
-                for k in range(7):
-                    r = m * (.75 - k * .08)
-                    Color(col[0], col[1], col[2], .07)
-                    Ellipse(pos=(cx - r / 2, cy - r / 2), size=(r, r))
+            if tex is not None and self.width > 1 and self.height > 1:
+                tw, th = tex.size
+                sc = max(self.width / float(tw), self.height / float(th))
+                uf = min(1.0, self.width / (tw * sc))
+                vf = min(1.0, self.height / (th * sc))
+                u0, v0 = (1 - uf) / 2, (1 - vf) / 2
+                Color(1, 1, 1, 1)
+                Rectangle(pos=self.pos, size=self.size, texture=tex,
+                          tex_coords=crop_coords(tex, u0, v0, u0 + uf, v0 + vf))
+                Color(0, 0, 0, app.bg_dim)
+                Rectangle(pos=self.pos, size=self.size)
+            if app.glow_on:
+                for col, cx, cy in ((app.c1, self.x + self.width * .1, self.top - self.height * .05),
+                                    (app.c2, self.right - self.width * .05, self.y + self.height * .05)):
+                    for k in range(7):
+                        r = m * (.75 - k * .08)
+                        Color(col[0], col[1], col[2], .07)
+                        Ellipse(pos=(cx - r / 2, cy - r / 2), size=(r, r))
 
 
 class Disc(Widget):
@@ -1146,7 +1175,7 @@ class Stage(Widget):
         # far glow
         gx, gy = proj(0, 0, -.7 * S)
         c1 = app.c1
-        self.glow_c.rgba = (c1[0], c1[1], c1[2], .07)
+        self.glow_c.rgba = (c1[0], c1[1], c1[2], .07 if app.glow_on else 0)
         for i, e in enumerate(self.glow):
             r = S * .75 * (1 - i / 7.0) * (1 + bass * .25)
             e.pos, e.size = (gx - r, gy - r), (2 * r, 2 * r)
@@ -1709,6 +1738,7 @@ KV = r'''
 
 <Root>:
     Backdrop:
+        custom: True
         pos_hint: {'x': 0, 'y': 0}
     BoxLayout:
         pos_hint: {'x': 0, 'y': 0}
@@ -1721,7 +1751,7 @@ KV = r'''
             BoxLayout:
                 orientation: 'vertical'
                 Label:
-                    text: 'DCED Plyer'
+                    text: 'MPDG Player'
                     font_name: 'Display'
                     font_size: sp(28)
                     halign: 'left'
@@ -1899,7 +1929,11 @@ KV = r'''
 
 # ------------------------------------------------------------ app
 DEL_REQ = 7311
-APP_VERSION = "1.4"
+BG_REQ = 7312
+# preset background colours for the song list (used behind / without a photo)
+BG_PRESETS = [(.03, .024, .07), (0., 0., 0.), (.02, .05, .13),
+              (.13, .02, .05), (.02, .09, .05), (.10, .05, .02)]
+APP_VERSION = "1.5"
 
 
 def prep(s):
@@ -1913,7 +1947,7 @@ def prep(s):
 
 
 class GlassApp(App):
-    title = "DCED Plyer"
+    title = "MPDG Player"
     c1 = ListProperty([.486, .302, 1, 1])
     c2 = ListProperty([0, .898, 1, 1])
     has_song = BooleanProperty(False)
@@ -1944,10 +1978,17 @@ class GlassApp(App):
     sway = NumericProperty(1.0)
     viz_on = BooleanProperty(True)
     flip = BooleanProperty(True)
+    glow_on = BooleanProperty(True)          # coloured glow lights on / off
+    bg_img = StringProperty("")              # custom song-list background (file path)
+    bg_dim = NumericProperty(.45)            # darkening over the photo
+    bg_col = NumericProperty(0)              # preset colour index
+    bg_tex = ObjectProperty(None, allownone=True)
     SKEYS = ("tilt_on", "theme_auto", "accent_hue", "row_fill", "mini_op",
-             "rad_row", "fx3d", "sway", "viz_on", "flip")
+             "rad_row", "fx3d", "sway", "viz_on", "flip",
+             "glow_on", "bg_img", "bg_dim", "bg_col")
     DEFAULTS = dict(tilt_on=True, theme_auto=True, accent_hue=260, row_fill=.09,
-                    mini_op=.88, rad_row=22, fx3d=1.0, sway=1.0, viz_on=True, flip=True)
+                    mini_op=.88, rad_row=22, fx3d=1.0, sway=1.0, viz_on=True, flip=True,
+                    glow_on=True, bg_img="", bg_dim=.45, bg_col=0)
     EQ_DEF = {"c": "eq", "on": False, "bands": [0, 0, 0, 0, 0], "bass": 0, "virt": 0, "loud": 0}
 
     def goto_playlist(self):
@@ -2008,8 +2049,82 @@ class GlassApp(App):
             self.set_hue(self.hue)
         elif k == "flip":
             self._apply_flip()
+        elif k == "bg_img":
+            self._load_bg()
         elif k == "tilt_on":
             self.tilt_enable(self.tilt_on and self.sheet.opened)
+
+    # ---- custom song-list background
+    def _load_bg(self):
+        tex = None
+        p = self.bg_img
+        if p and os.path.isfile(p):
+            try:
+                tex = CoreImage(p).texture
+            except Exception:
+                tex = None
+        self.bg_tex = tex
+
+    def pick_bg(self):
+        if platform != "android":
+            self.toast("Picking a photo works on the phone only")
+            return
+        try:
+            from jnius import autoclass
+            Intent = autoclass("android.content.Intent")
+            it = Intent(Intent.ACTION_GET_CONTENT)
+            it.setType("image/*")
+            it.addCategory(Intent.CATEGORY_OPENABLE)
+            get_activity().startActivityForResult(it, BG_REQ)
+        except Exception:
+            self.toast("Could not open the gallery")
+
+    def _bg_from_uri(self, uri):
+        """Decode the picked photo (down-scaled), save it as our own jpg."""
+        try:
+            from jnius import autoclass
+            act = get_activity()
+            res = act.getContentResolver()
+            BF = autoclass("android.graphics.BitmapFactory")
+            Opts = autoclass("android.graphics.BitmapFactory$Options")
+            o = Opts()
+            o.inJustDecodeBounds = True
+            st = res.openInputStream(uri)
+            BF.decodeStream(st, None, o)
+            st.close()
+            ss = 1
+            while max(o.outWidth, o.outHeight) / float(ss) > 2000:
+                ss *= 2
+            o2 = Opts()
+            o2.inSampleSize = ss
+            st = res.openInputStream(uri)
+            bmp = BF.decodeStream(st, None, o2)
+            st.close()
+            out = os.path.join(pc.data_dir(), "listbg_%d.jpg" % int(time.time()))
+            fo = autoclass("java.io.FileOutputStream")(out)
+            bmp.compress(autoclass("android.graphics.Bitmap$CompressFormat").JPEG, 90, fo)
+            fo.flush()
+            fo.close()
+            old = self.bg_img
+            self.pset("bg_img", out)
+            if old and old != out:
+                try:
+                    os.remove(old)
+                except Exception:
+                    pass
+            self.toast("Background set")
+        except Exception:
+            self.toast("Could not use that photo")
+
+    def clear_bg(self):
+        old = self.bg_img
+        self.pset("bg_img", "")
+        if old:
+            try:
+                os.remove(old)
+            except Exception:
+                pass
+        self.toast("Background removed")
 
     def _apply_flip(self):
         st = self.stage
@@ -2198,6 +2313,39 @@ class GlassApp(App):
         sec("COLORS")
         tog("Colors follow the cover", "theme_auto")
         sld("Accent color", "accent_hue", 0, 360)
+        sec("SONG LIST BACKGROUND AND LIGHTS")
+        tog("Glow lights", "glow_on")
+        pb = TxtBtn(text="Choose a photo for the song list")
+        pb.bgc = [1, 1, 1, .08]
+        pb.bind(on_release=lambda *a: self.pick_bg())
+        col.add_widget(pb)
+        cb = TxtBtn(text="Remove photo")
+        cb.bgc = [1, 1, 1, .08]
+        cb.bind(on_release=lambda *a: self.clear_bg())
+        col.add_widget(cb)
+        sld("Photo darkness", "bg_dim", 0, .85)
+        sw = BoxLayout(size_hint_y=None, height=dp(48), spacing=dp(8), padding=(dp(6), 0))
+        sw.add_widget(Label(text="Background color", font_size=sp(14), size_hint_x=.34,
+                            halign="left", valign="middle",
+                            text_size=((Window.width - dp(40)) * .34, dp(48))))
+        btns = []
+
+        def mark():
+            for j, b in enumerate(btns):
+                b.text = "\u2022" if int(self.bg_col) == j else ""
+
+        def pick(j):
+            self.pset("bg_col", j)
+            mark()
+        for j, c in enumerate(BG_PRESETS):
+            b = TxtBtn()
+            b.font_size = sp(22)
+            b.bgc = [min(1, c[0] * 3 + .12), min(1, c[1] * 3 + .12), min(1, c[2] * 3 + .12), 1]
+            b.bind(on_release=lambda w, j=j: pick(j))
+            btns.append(b)
+            sw.add_widget(b)
+        mark()
+        col.add_widget(sw)
         sec("LIST AND MINI PLAYER")
         sld("List transparency", "row_fill", .02, .3)
         sld("Mini player opacity", "mini_op", .2, 1)
@@ -2217,6 +2365,7 @@ class GlassApp(App):
             self.save_settings()
             self.set_hue(self.hue)
             self._apply_flip()
+            self._load_bg()
             mv.dismiss()
             self.toast("Reset")
         rb.bind(on_release=reset)
@@ -2226,7 +2375,7 @@ class GlassApp(App):
 
     def _about_view(self):
         b = BoxLayout(orientation="vertical", spacing=dp(6), padding=dp(10))
-        b.add_widget(Label(text="DCED Plyer", font_name="Display", font_size=sp(32),
+        b.add_widget(Label(text="MPDG Player", font_name="Display", font_size=sp(32),
                            size_hint_y=None, height=dp(60)))
         for k, v in (("Version", APP_VERSION), ("Songs", str(self.nsongs)),
                      ("Engine", "Android MediaPlayer + AudioFX"),
@@ -2271,6 +2420,7 @@ class GlassApp(App):
         self.remote = Remote(self)
         Window.bind(on_keyboard=self.on_key)
         self.load_settings()
+        self._load_bg()
         Builder.load_string(KV)
         return Root()
 
@@ -2360,7 +2510,7 @@ class GlassApp(App):
         top = Label(text="Welcome To", font_name="Display", font_size="19sp",
                     color=(1, 1, 1, .78), halign="center", valign="bottom",
                     size_hint=(1, .30))
-        name = Label(text="Music Plyer DECD", font_name="Display", font_size="29sp",
+        name = Label(text="MPDG Player", font_name="Display", font_size="29sp",
                      color=(1, 1, 1, 1), halign="center", valign="middle",
                      size_hint=(1, .42))
         for lb in (top, name):
@@ -2685,6 +2835,15 @@ class GlassApp(App):
             self.toast("Delete failed")
 
     def _on_activity_result(self, code, result, intent):
+        if code == BG_REQ:
+            if result == -1 and intent is not None:
+                try:
+                    uri = intent.getData()
+                except Exception:
+                    uri = None
+                if uri is not None:
+                    Clock.schedule_once(lambda dt: self._bg_from_uri(uri))
+            return
         if code != DEL_REQ:
             return
         paths = list(self._del_paths)
