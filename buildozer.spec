@@ -5,14 +5,14 @@ package.domain = org.glass
 source.dir = .
 source.include_exts = py,ttf,png,jpg
 source.exclude_dirs = .github,bin,java,blocks
-version = 1.1
+version = 1.2
 icon.filename = %(source.dir)s/icon.png
 presplash.filename = %(source.dir)s/presplash.png
 android.presplash_color = #08061A
 requirements = python3==3.11.5,hostpython3==3.11.5,kivy==2.3.0,pillow,pyjnius,android,plyer,mutagen,arabic-reshaper==3.0.0,python-bidi==0.4.2,six
 orientation = portrait
 fullscreen = 0
-android.permissions = READ_EXTERNAL_STORAGE,READ_MEDIA_AUDIO,POST_NOTIFICATIONS,WAKE_LOCK,INTERNET,FOREGROUND_SERVICE,FOREGROUND_SERVICE_MEDIA_PLAYBACK
+android.permissions = READ_EXTERNAL_STORAGE,READ_MEDIA_AUDIO,POST_NOTIFICATIONS,WAKE_LOCK,INTERNET,FOREGROUND_SERVICE,FOREGROUND_SERVICE_MEDIA_PLAYBACK,REQUEST_IGNORE_BATTERY_OPTIMIZATIONS
 android.api = 33
 android.minapi = 24
 android.ndk = 25b

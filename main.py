@@ -26,9 +26,10 @@ from kivy.clock import Clock
 from kivy import kivy_data_dir
 from kivy.core.image import Image as CoreImage
 from kivy.core.text import DEFAULT_FONT, LabelBase
+from kivy.core.text import Label as CoreLabel
 from kivy.core.window import Window
 from kivy.graphics import (Color, Ellipse, Line, PopMatrix, PushMatrix,
-                           Rectangle, Rotate, RoundedRectangle, Triangle)
+                           Mesh, Rectangle, Rotate, RoundedRectangle, Triangle)
 from kivy.graphics.texture import Texture
 from kivy.lang import Builder
 from kivy.metrics import dp
@@ -841,29 +842,6 @@ class Backdrop(Widget):
                     Ellipse(pos=(cx - r / 2, cy - r / 2), size=(r, r))
 
 
-class Halo(Widget):
-    scale = NumericProperty(0)
-    ox = NumericProperty(0)
-    oy = NumericProperty(0)
-
-    def __init__(self, **kw):
-        super().__init__(**kw)
-        self.bind(pos=self.draw, size=self.draw, scale=self.draw, ox=self.draw, oy=self.draw)
-        App.get_running_app().bind(c1=self.draw)
-        self.draw()
-
-    def draw(self, *a):
-        c = App.get_running_app().c1
-        k = 1 + self.scale * .3
-        self.canvas.clear()
-        with self.canvas:
-            for i in range(8):
-                r = min(self.size) * .5 * (1 - i / 8.0) * k
-                Color(c[0], c[1], c[2], .07)
-                Ellipse(pos=(self.center_x + self.ox - r, self.center_y + self.oy - r),
-                        size=(2 * r, 2 * r))
-
-
 class Disc(Widget):
     ang = NumericProperty(0)
 
@@ -985,13 +963,205 @@ class Seek(Slider):
             app.t0 = fmt(self.value / 1000.0 * app.r_dur)
 
 
-class Stage(FloatLayout):
-    tx = NumericProperty(0)      # finger tilt   (-1..1)
-    ty = NumericProperty(0)
-    px = NumericProperty(0)      # final tilt = phone sensor + finger
-    py = NumericProperty(0)
-    bob = NumericProperty(0)     # gentle floating motion
+def rr_ring(hw, hh, r, n=6):
+    """Closed rounded-rectangle outline (counter-clockwise)."""
+    pts = []
+    for ccx, ccy, a0 in ((hw - r, hh - r, 0), (-(hw - r), hh - r, 90),
+                         (-(hw - r), -(hh - r), 180), (hw - r, -(hh - r), 270)):
+        for i in range(n + 1):
+            a = math.radians(a0 + 90.0 * i / n)
+            pts.append((ccx + r * math.cos(a), ccy + r * math.sin(a)))
+    return pts
 
+
+def ring_template(n=6, rings=3):
+    """Unit rounded square as a triangle mesh (centre + concentric rings)."""
+    ring = rr_ring(1.0, 1.0, .21, n)
+    N = len(ring)
+    base = [(0.0, 0.0)] + [(k * x / rings, k * y / rings)
+                           for k in range(1, rings + 1) for x, y in ring]
+    idx = []
+    for i in range(N):
+        idx += [0, 1 + i, 1 + (i + 1) % N]
+    for k in range(1, rings):
+        a, b = 1 + (k - 1) * N, 1 + k * N
+        for i in range(N):
+            j = (i + 1) % N
+            idx += [a + i, b + i, b + j, a + i, b + j, a + j]
+    return base, idx, N
+
+
+def make_proj(cx, cy, S, ay, ax, az, zpush):
+    """Perspective projection of a plane point (x, y) lying at depth zl."""
+    cyr, syr, cxr, sxr = math.cos(ay), math.sin(ay), math.cos(ax), math.sin(ax)
+    czr, szr = math.cos(az), math.sin(az)
+    D = S * 2.4
+
+    def proj(x, y, zl):
+        x, y = x * czr - y * szr, x * szr + y * czr
+        x1 = x * cyr + zl * syr
+        z1 = -x * syr + zl * cyr
+        y2 = y * cxr - z1 * sxr
+        z2 = y * sxr + z1 * cxr + zpush
+        f = D / max(D * .25, D - z2)
+        return cx + x1 * f, cy + y2 * f
+    return proj
+
+
+class Stage(Widget):
+    """Cover art as a real 3D card (perspective mesh) with layers at different
+    depths: glow (far) < back picture < cover < glass edge (near).
+    It keeps swaying by itself like a looping video; the phone's tilt / spin
+    and a finger add to the motion."""
+    tx = NumericProperty(0)      # finger tilt (-1..1)
+    ty = NumericProperty(0)
+    px = NumericProperty(0)      # final tilt = auto + sensors + finger
+    py = NumericProperty(0)
+    hue = NumericProperty(0)
+    letter = StringProperty("")
+    path = StringProperty("")
+    texture = ObjectProperty(None, allownone=True)
+    bg = ListProperty([.6, .2, .8, 1])
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.touching = False
+        self.amp = 0.0
+        self.kx = self.ky = self.kr = 0.0
+        self.t = 0.0
+        self.bass_v = 0.0
+        self._ltex = None
+        self._lkey = None
+        self.base, idx, self.N = ring_template()
+        self.uv = [(x * .5 + .5, y * .5 + .5) for x, y in self.base]
+        zeros = [0.0] * (4 * len(self.base))
+        t = Texture.create(size=(64, 1), colorfmt="rgba")
+        buf = bytearray()
+        for i in range(64):
+            d = abs(i / 63.0 - .5) / .16
+            buf += bytes((255, 255, 255, int((max(0.0, 1.0 - d) ** 2) * .38 * 255)))
+        t.blit_buffer(bytes(buf), colorfmt="rgba", bufferfmt="ubyte")
+        t.mag_filter = t.min_filter = "linear"
+        self.sheen_tex = t
+        with self.canvas:
+            self.glow_c = Color(1, 1, 1, .07)
+            self.glow = [Ellipse() for _ in range(7)]
+            self.back_c = Color(1, 1, 1, .34)
+            self.back = Mesh(vertices=list(zeros), indices=idx, mode="triangles")
+            self.cov_c = Color(1, 1, 1, 1)
+            self.cov = Mesh(vertices=list(zeros), indices=idx, mode="triangles")
+            self.let_c = Color(1, 1, 1, 0)
+            self.let = Mesh(vertices=[0.0] * 16, indices=[0, 1, 2, 0, 2, 3], mode="triangles")
+            self.sh_c = Color(1, 1, 1, 1)
+            self.sheen = Mesh(vertices=list(zeros), indices=idx, mode="triangles",
+                              texture=self.sheen_tex)
+            self.edge_c = Color(1, 1, 1, .30)
+            self.edge = Line(points=[0, 0, 1, 1, 2, 2], width=dp(1.2), close=True)
+
+    # ---- artwork
+    def on_hue(self, *a):
+        r, g, b = colorsys.hls_to_rgb((self.hue % 360) / 360., .42, .8)
+        self.bg = [r, g, b, 1]
+
+    def set_cover(self, path, size, cb=None):
+        if path == self.path and self.texture is not None:
+            return
+        self.path = path
+        self.texture = None
+        App.get_running_app().covers.get(path, size, lambda t, h: self._got(path, t))
+
+    def _got(self, path, tex):
+        if path == self.path:
+            self.texture = tex
+
+    def _letter_tex(self):
+        key = self.letter
+        if key != self._lkey:
+            self._lkey = key
+            try:
+                lb = CoreLabel(text=key or "\u266a", font_size=160)
+                lb.refresh()
+                self._ltex = lb.texture
+            except Exception:
+                self._ltex = None
+        return self._ltex
+
+    # ---- motion
+    def update3d(self, dt, t, playing, bass, sx, sy, wx, wy, wz):
+        dt = max(.001, min(dt, .1))
+        self.t, self.bass_v = t, bass
+        goal = 0.0 if self.touching else (1.0 if playing else .55)
+        self.amp += (goal - self.amp) * min(1.0, dt * 3)
+        ax_ = (math.sin(t * .9) * .60 + math.sin(t * .37 + 1.3) * .28) * self.amp
+        ay_ = (math.cos(t * .71) * .42 + math.sin(t * .29 + .5) * .20) * self.amp
+        d = math.exp(-dt * 2.4)
+        self.kx = max(-1.0, min(1.0, (self.kx - wy * dt * .9) * d))     # phone rolled left/right
+        self.ky = max(-1.0, min(1.0, (self.ky + wx * dt * .9) * d))     # phone pitched
+        self.kr = max(-14.0, min(14.0, (self.kr - wz * dt * 40) * math.exp(-dt * 2.0)))  # spun
+        self.px = max(-1.0, min(1.0, ax_ + sx + self.kx + self.tx))
+        self.py = max(-1.0, min(1.0, ay_ + sy + self.ky + self.ty))
+        self.redraw()
+
+    def redraw(self):
+        S = min(self.width, self.height)
+        if S < 4:
+            return
+        app = App.get_running_app()
+        hs = S * .47
+        cx, cy = self.center
+        bass = self.bass_v
+        zpush = (.02 + bass * .12 + math.sin(self.t * .8) * .012
+                 - (abs(self.px) + abs(self.py)) * .04) * S
+        proj = make_proj(cx, cy, S, math.radians(self.px * 22), math.radians(-self.py * 17),
+                         math.radians(self.kr), zpush)
+        tex, bg = self.texture, self.bg
+
+        def verts(scale, zl, uoff=0.0):
+            out = []
+            for (bx, by), (u, v) in zip(self.base, self.uv):
+                X, Y = proj(bx * hs * scale, by * hs * scale, zl)
+                out += (X, Y, u + uoff, v)
+            return out
+
+        # far glow
+        gx, gy = proj(0, 0, -.7 * S)
+        c1 = app.c1
+        self.glow_c.rgba = (c1[0], c1[1], c1[2], .07)
+        for i, e in enumerate(self.glow):
+            r = S * .75 * (1 - i / 7.0) * (1 + bass * .25)
+            e.pos, e.size = (gx - r, gy - r), (2 * r, 2 * r)
+        # back picture (deeper layer -> moves more)
+        self.back_c.rgba = (1, 1, 1, .34) if tex else (bg[0], bg[1], bg[2], .30)
+        self.back.texture = tex
+        self.back.vertices = verts(1.2, -.45 * S)
+        # cover
+        self.cov_c.rgba = (1, 1, 1, 1) if tex else tuple(bg)
+        self.cov.texture = tex
+        self.cov.vertices = verts(1.0, 0)
+        # letter when there is no artwork
+        lt = None if tex else self._letter_tex()
+        if lt is not None:
+            k = (S * .40) / 160.0
+            w, h = lt.width * k / 2, lt.height * k / 2
+            q = []
+            for (x, y), (u, v) in zip(((-w, -h), (w, -h), (w, h), (-w, h)),
+                                      ((0, 0), (1, 0), (1, 1), (0, 1))):
+                X, Y = proj(x, y, .01 * S)
+                q += (X, Y, u, 1 - v)
+            self.let.texture = lt
+            self.let.vertices = q
+            self.let_c.rgba = (1, 1, 1, 1)
+        else:
+            self.let_c.rgba = (1, 1, 1, 0)
+        # glossy band slides with the tilt
+        self.sheen.vertices = verts(1.0, .02 * S, -self.px * .5)
+        # glass edge (nearest layer)
+        pts = []
+        for x, y in self.base[-self.N:]:
+            pts += proj(x * hs, y * hs, .07 * S)
+        self.edge.points = pts
+
+    # ---- finger
     def _tilt(self, t):
         rx = (t.x - self.x) / max(1, self.width) - .5
         ry = (t.y - self.y) / max(1, self.height) - .5
@@ -1002,6 +1172,7 @@ class Stage(FloatLayout):
     def on_touch_down(self, t):
         if self.collide_point(*t.pos):
             t.grab(self)
+            self.touching = True
             self._tilt(t)
             return True
         return super().on_touch_down(t)
@@ -1015,38 +1186,10 @@ class Stage(FloatLayout):
     def on_touch_up(self, t):
         if t.grab_current is self:
             t.ungrab(self)
+            self.touching = False
             Animation(tx=0, ty=0, d=.45, t="out_cubic").start(self)
             return True
         return super().on_touch_up(t)
-
-
-class Sheen(Widget):
-    """Glossy light band that slides across the cover as the phone tilts."""
-    k = NumericProperty(0)
-    rad = NumericProperty(dp(30))
-
-    def __init__(self, **kw):
-        super().__init__(**kw)
-        t = Texture.create(size=(64, 1), colorfmt="rgba")
-        buf = bytearray()
-        for i in range(64):
-            d = abs(i / 63.0 - .5) / .16
-            a = (max(0.0, 1.0 - d) ** 2) * .34
-            buf += bytes((255, 255, 255, int(a * 255)))
-        t.blit_buffer(bytes(buf), colorfmt="rgba", bufferfmt="ubyte")
-        t.mag_filter = t.min_filter = "linear"
-        self.tex = t
-        self.bind(pos=self.draw, size=self.draw, k=self.draw)
-        self.draw()
-
-    def draw(self, *a):
-        u0 = -self.k * .5
-        self.canvas.clear()
-        with self.canvas:
-            Color(1, 1, 1, 1)
-            RoundedRectangle(pos=self.pos, size=self.size, radius=[self.rad],
-                             texture=self.tex,
-                             tex_coords=(u0, 0, u0 + 1, 0, u0 + 1, 1, u0, 1))
 
 
 class Sheet(FloatLayout):
@@ -1334,49 +1477,6 @@ KV = r'''
         pos_hint: {'center_y': .5}
         on_release: app.toggle()
 
-<Stage>:
-    canvas.before:
-        PushMatrix
-        Translate:
-            xy: self.px * dp(12), self.bob + self.py * dp(8)
-        Rotate:
-            angle: self.px * 15
-            axis: 0, 1, 0
-            origin: self.center
-        Rotate:
-            angle: -self.py * 12
-            axis: 1, 0, 0
-            origin: self.center
-    canvas.after:
-        PopMatrix
-    Halo:
-        size_hint: 1.32, 1.32
-        pos_hint: {'center_x': .5, 'center_y': .5}
-        scale: app.bass
-        ox: -root.px * dp(24)
-        oy: root.py * dp(14)
-    CoverBox:
-        id: cov
-        size_hint: .94, .94
-        pos_hint: {'center_x': .5, 'center_y': .5}
-        rad: dp(30)
-        hue: app.cur_hue
-        letter: app.cur_letter
-    Sheen:
-        size_hint: .94, .94
-        pos_hint: {'center_x': .5, 'center_y': .5}
-        rad: dp(30)
-        k: root.px
-    Widget:
-        size_hint: .94, .94
-        pos_hint: {'center_x': .5, 'center_y': .5}
-        canvas:
-            Color:
-                rgba: 1, 1, 1, .28
-            Line:
-                rounded_rectangle: (self.x, self.y, self.width, self.height, dp(30))
-                width: dp(1.2)
-
 <Sheet>:
     Backdrop:
         pos_hint: {'x': 0, 'y': 0}
@@ -1408,6 +1508,8 @@ KV = r'''
             size_hint: None, None
             size: [min(root.width * .7, root.height * .34, dp(320))] * 2
             pos_hint: {'center_x': .5}
+            hue: app.cur_hue
+            letter: app.cur_letter
         Label:
             text: app.cur_title
             font_size: sp(24)
@@ -1756,6 +1858,8 @@ class GlassApp(App):
         self._scanned_once = False
         self._acc = None
         self._acc_on = False
+        self._gyro = None
+        self._gyro_on = False
         self._pitch = None
         self.tilt_x = self.tilt_y = 0.0
         self._del_paths = []
@@ -1778,7 +1882,7 @@ class GlassApp(App):
             self._index()
             self.refresh()
             self.empty_text = ""
-        Clock.schedule_interval(self.tick, 1 / 24.)
+        Clock.schedule_interval(self.tick, 1 / 30.)
         self.show_welcome()
         # 2) re-attach to the playback service if music is already running
         self.remote.hello()
@@ -1888,6 +1992,27 @@ class GlassApp(App):
             self.toast("Allow music access to see your songs")
         if not self.songs or not self._scanned_once:
             self.rescan(True)
+        Clock.schedule_once(lambda dt: self.ask_battery(), 1.5)
+
+    def ask_battery(self):
+        """One-time system prompt so the OS doesn't kill the player in the background."""
+        if platform != "android":
+            return
+        flag = os.path.join(pc.data_dir(), "batt.flag")
+        try:
+            if os.path.exists(flag):
+                return
+            from jnius import autoclass
+            act = get_activity()
+            pkg = act.getPackageName()
+            if act.getSystemService("power").isIgnoringBatteryOptimizations(pkg):
+                return
+            i = autoclass("android.content.Intent")("android.settings.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS")
+            i.setData(autoclass("android.net.Uri").parse("package:" + pkg))
+            act.startActivity(i)
+            open(flag, "w").close()
+        except Exception:
+            pass
 
     def have_audio_perm(self):
         try:
@@ -2203,7 +2328,7 @@ class GlassApp(App):
         self.has_song = True
         self.set_hue(self.cur_hue)
         self.mini.ids.cov.set_cover(s["path"], 160)
-        self.stage.ids.cov.set_cover(s["path"], 400)
+        self.stage.set_cover(s["path"], 400)
         self.frac, self.t0 = 0, "0:00"
         self.mark_current()
 
@@ -2288,21 +2413,23 @@ class GlassApp(App):
             self.r_pos, self.r_t = f * self.r_dur, time.time()
             self.remote.send({"c": "seek", "sec": self.r_pos})
 
-    # ---- phone tilt (accelerometer) moves the cover in the player
+    # ---- phone tilt (accelerometer) + spin (gyroscope) drive the 3D cover
     def tilt_enable(self, on):
         if platform != "android":
             return
-        try:
-            from plyer import accelerometer
-            self._acc = accelerometer
-            if on and not self._acc_on:
-                accelerometer.enable()
-                self._acc_on = True
-            elif not on and self._acc_on:
-                accelerometer.disable()
-                self._acc_on = False
-        except Exception:
-            self._acc_on = False
+        for name, attr, flag in (("accelerometer", "_acc", "_acc_on"),
+                                 ("gyroscope", "_gyro", "_gyro_on")):
+            try:
+                mod = getattr(__import__("plyer", fromlist=[name]), name)
+                setattr(self, attr, mod)
+                if on and not getattr(self, flag):
+                    mod.enable()
+                    setattr(self, flag, True)
+                elif not on and getattr(self, flag):
+                    mod.disable()
+                    setattr(self, flag, False)
+            except Exception:
+                setattr(self, flag, False)
 
     def update_tilt(self, dt):
         tx = ty = 0.0
@@ -2319,10 +2446,16 @@ class GlassApp(App):
                 pass
         self.tilt_x += (tx - self.tilt_x) * .2
         self.tilt_y += (ty - self.tilt_y) * .2
-        st = self.stage
-        st.px = max(-1.0, min(1.0, self.tilt_x + st.tx))
-        st.py = max(-1.0, min(1.0, self.tilt_y + st.ty))
-        st.bob = math.sin(self.t * 1.4) * dp(3) * (1.0 if self.playing else .3)
+        wx = wy = wz = 0.0
+        if self._gyro_on and self._gyro is not None:
+            try:
+                g = self._gyro.rotation
+                if g and g[0] is not None:
+                    wx, wy, wz = g
+            except Exception:
+                pass
+        self.stage.update3d(dt, self.t, self.playing, self.bass,
+                            self.tilt_x, self.tilt_y, wx, wy, wz)
 
     # ---- per-frame
     def tick(self, dt):

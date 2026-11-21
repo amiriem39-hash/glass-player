@@ -10,6 +10,7 @@ import json
 import os
 import select
 import socket
+import sys
 import time
 import traceback
 
@@ -27,8 +28,24 @@ SDK = autoclass("android.os.Build$VERSION").SDK_INT
 Bridge = autoclass("org.dced.player.Bridge")
 
 
-def log():
-    traceback.print_exc()
+LOGF = os.path.join(pc.data_dir(), "service.log")
+
+
+def log(msg=""):
+    """Errors go to service.log (inside the app data dir) as well as logcat."""
+    try:
+        if os.path.isfile(LOGF) and os.path.getsize(LOGF) > 100000:
+            os.remove(LOGF)
+        with open(LOGF, "a", encoding="utf-8") as f:
+            f.write("[%s] %s\n" % (time.strftime("%H:%M:%S"), msg))
+            if sys.exc_info()[0] is not None:
+                f.write(traceback.format_exc())
+    except Exception:
+        pass
+    try:
+        traceback.print_exc()
+    except Exception:
+        pass
 
 
 class Notifier:
@@ -42,34 +59,53 @@ class Notifier:
         self.fg = False
         self._cov = None
         self.ok = False
+        self.fails = 0
 
     def setup(self):
         self.manager = ctx.getSystemService("notification")
-        if SDK >= 26:
-            Channel = autoclass("android.app.NotificationChannel")
-            ch = Channel(CHANNEL, "DCED Plyer playback", 2)
-            ch.setDescription("Music playback controls")
-            try:
-                ch.setShowBadge(False)
-            except Exception:
-                pass
-            self.manager.createNotificationChannel(ch)
-        MediaSession = autoclass("android.media.session.MediaSession")
-        Handler = autoclass("android.os.Handler")
-        Looper = autoclass("android.os.Looper")
-        self.session = MediaSession(ctx, "DCED Plyer")
-        self.session.setFlags(3)
-        self.session.setCallback(autoclass("org.dced.player.MediaCallback")(),
-                                 Handler(Looper.getMainLooper()))
-        self.session.setActive(True)
-        IntentFilter = autoclass("android.content.IntentFilter")
-        f = IntentFilter()
-        for a in ("PREV", "TOGGLE", "NEXT", "CLOSE"):
-            f.addAction(PKG + "." + a)
-        f.addAction("android.media.AUDIO_BECOMING_NOISY")
-        self.receiver = autoclass("org.dced.player.ControlReceiver")()
-        ctx.registerReceiver(self.receiver, f)
-        self.ok = True
+        try:
+            if SDK >= 26:
+                Channel = autoclass("android.app.NotificationChannel")
+                ch = Channel(CHANNEL, "DCED Plyer playback", 2)
+                ch.setDescription("Music playback controls")
+                try:
+                    ch.setShowBadge(False)
+                except Exception:
+                    pass
+                self.manager.createNotificationChannel(ch)
+        except Exception:
+            log("channel")
+        self.ok = True                      # notification works even if the session fails
+        try:
+            MediaSession = autoclass("android.media.session.MediaSession")
+            Handler = autoclass("android.os.Handler")
+            Looper = autoclass("android.os.Looper")
+            self.session = MediaSession(ctx, "DCED Plyer")
+            self.session.setFlags(3)
+            self.session.setCallback(autoclass("org.dced.player.MediaCallback")(),
+                                     Handler(Looper.getMainLooper()))
+            self.session.setActive(True)
+        except Exception:
+            self.session = None
+            log("media session")
+        try:
+            IntentFilter = autoclass("android.content.IntentFilter")
+            f = IntentFilter()
+            for a in ("PREV", "TOGGLE", "NEXT", "CLOSE"):
+                f.addAction(PKG + "." + a)
+            f.addAction("android.media.AUDIO_BECOMING_NOISY")
+            self.receiver = autoclass("org.dced.player.ControlReceiver")()
+            ctx.registerReceiver(self.receiver, f)
+        except Exception:
+            self.receiver = None
+            log("receiver")
+
+    def promote(self):
+        """Replace the default python-for-android notification right away."""
+        try:
+            self.notify("DCED Plyer", "", None, False, media=False)
+        except Exception:
+            log("promote")
 
     # ---- cover art for the notification / lock screen
     def cover(self, it):
@@ -147,45 +183,62 @@ class Notifier:
         it = core.cur
         if not it or not self.ok:
             return
-        playing = core.engine.playing()
-        title = it["title"] or "DCED Plyer"       # raw text: Android shapes Persian itself
-        artist = it["artist"] or ""
-        pos = int(core.engine.pos() * 1000)
-        dur = int(core.engine.dur() * 1000)
-        bmp = self.cover(it)
         try:
-            MB = autoclass("android.media.MediaMetadata$Builder")
-            mb = MB()
-            mb.putString("android.media.metadata.TITLE", title)
-            mb.putString("android.media.metadata.ARTIST", artist)
-            mb.putLong("android.media.metadata.DURATION", dur)
-            if bmp is not None:
-                mb.putBitmap("android.media.metadata.ALBUM_ART", bmp)
-            self.session.setMetadata(mb.build())
-            PS = autoclass("android.media.session.PlaybackState")
-            PB = autoclass("android.media.session.PlaybackState$Builder")
-            RD = autoclass("android.R$drawable")
-            actions = (PS.ACTION_PLAY | PS.ACTION_PAUSE | PS.ACTION_PLAY_PAUSE |
-                       PS.ACTION_SKIP_TO_NEXT | PS.ACTION_SKIP_TO_PREVIOUS |
-                       PS.ACTION_SEEK_TO | PS.ACTION_STOP)
-            pb = PB()
-            pb.setActions(actions)
-            pb.setState(3 if playing else 2, pos, 1.0 if playing else 0.0)
+            playing = core.engine.playing()
+            title = it["title"] or "DCED Plyer"   # raw text: Android shapes Persian itself
+            artist = it["artist"] or ""
+            pos = int(core.engine.pos() * 1000)
+            dur = int(core.engine.dur() * 1000)
+        except Exception:
+            log("state")
+            return
+        bmp = None
+        try:
+            bmp = self.cover(it)
+        except Exception:
+            log("cover")
+        if self.session is not None:
             try:
-                pb.addCustomAction("close", "Close", RD.ic_menu_close_clear_cancel)
+                MB = autoclass("android.media.MediaMetadata$Builder")
+                mb = MB()
+                mb.putString("android.media.metadata.TITLE", title)
+                mb.putString("android.media.metadata.ARTIST", artist)
+                mb.putLong("android.media.metadata.DURATION", dur)
+                if bmp is not None:
+                    mb.putBitmap("android.media.metadata.ALBUM_ART", bmp)
+                self.session.setMetadata(mb.build())
+                PS = autoclass("android.media.session.PlaybackState")
+                PB = autoclass("android.media.session.PlaybackState$Builder")
+                RD = autoclass("android.R$drawable")
+                actions = (PS.ACTION_PLAY | PS.ACTION_PAUSE | PS.ACTION_PLAY_PAUSE |
+                           PS.ACTION_SKIP_TO_NEXT | PS.ACTION_SKIP_TO_PREVIOUS |
+                           PS.ACTION_SEEK_TO | PS.ACTION_STOP)
+                pb = PB()
+                pb.setActions(actions)
+                pb.setState(3 if playing else 2, pos, 1.0 if playing else 0.0)
+                try:
+                    pb.addCustomAction("close", "Close", RD.ic_menu_close_clear_cancel)
+                except Exception:
+                    pass
+                self.session.setPlaybackState(pb.build())
+                self.session.setActive(True)
             except Exception:
-                pass
-            self.session.setPlaybackState(pb.build())
-        except Exception:
-            log()
+                log("session update")
         try:
-            self.notify(title, artist, bmp, playing)
+            self.notify(title, artist, bmp, playing, media=self.session is not None)
+            self.fails = 0
         except Exception:
-            log()
+            log("notify (media style)")
+            try:
+                self.notify(title, artist, bmp, playing, media=False)
+            except Exception:
+                log("notify (plain)")
+                self.fails += 1
+                if self.fails < 4:
+                    core.dirty = True          # retry on the next loop
 
-    def notify(self, title, artist, bmp, playing):
+    def notify(self, title, artist, bmp, playing, media=True):
         NB = autoclass("android.app.Notification$Builder")
-        MediaStyle = autoclass("android.app.Notification$MediaStyle")
         PendingIntent = autoclass("android.app.PendingIntent")
         Intent = autoclass("android.content.Intent")
         RD = autoclass("android.R$drawable")
@@ -200,7 +253,7 @@ class Notifier:
         b.setContentTitle(title)
         b.setContentText(artist)
         b.setSmallIcon(RD.ic_media_pause if playing else RD.ic_media_play)
-        b.setOngoing(bool(playing))
+        b.setOngoing(True)                  # stays pinned: the service must never be dropped
         b.setOnlyAlertOnce(True)
         b.setShowWhen(False)
         b.setVisibility(1)
@@ -209,21 +262,20 @@ class Notifier:
             b.setContentIntent(PendingIntent.getActivity(ctx, 10, launch, flags))
         if bmp is not None:
             b.setLargeIcon(bmp)
-        b.addAction(RD.ic_media_previous, "Previous", pending("PREV", 11))
-        b.addAction(RD.ic_media_pause if playing else RD.ic_media_play,
-                    "Pause" if playing else "Play", pending("TOGGLE", 12))
-        b.addAction(RD.ic_media_next, "Next", pending("NEXT", 13))
-        b.addAction(RD.ic_menu_close_clear_cancel, "Close", pending("CLOSE", 14))
-        style = MediaStyle()
-        style.setMediaSession(self.session.getSessionToken())
-        style.setShowActionsInCompactView([0, 1, 2])
-        b.setStyle(style)
-        n = b.build()
-        if not self.fg:
-            svc.startForeground(NOTIF_ID, n)       # also replaces the default service notification
-            self.fg = True
-        else:
-            self.manager.notify(NOTIF_ID, n)
+        if media:
+            b.addAction(RD.ic_media_previous, "Previous", pending("PREV", 11))
+            b.addAction(RD.ic_media_pause if playing else RD.ic_media_play,
+                        "Pause" if playing else "Play", pending("TOGGLE", 12))
+            b.addAction(RD.ic_media_next, "Next", pending("NEXT", 13))
+            b.addAction(RD.ic_menu_close_clear_cancel, "Close", pending("CLOSE", 14))
+            if self.session is not None:
+                MediaStyle = autoclass("android.app.Notification$MediaStyle")
+                style = MediaStyle()
+                style.setMediaSession(self.session.getSessionToken())
+                style.setShowActionsInCompactView([0, 1, 2])
+                b.setStyle(style)
+        svc.startForeground(NOTIF_ID, b.build())   # (re)posts it as the service's notification
+        self.fg = True
 
     def close(self):
         try:
@@ -346,8 +398,10 @@ class Service:
         try:
             self.note.setup()
         except Exception:
-            log()
+            log("setup")
         self.bind()
+        self.note.promote()
+        last_pub = time.time()
         while self.running:
             try:
                 r, _, _ = select.select([self.sock], [], [], .1)
@@ -359,7 +413,7 @@ class Service:
                     try:
                         self.on_msg(json.loads(data.decode("utf-8")))
                     except Exception:
-                        log()
+                        log("msg")
                     r, _, _ = select.select([self.sock], [], [], 0)
                 while True:
                     s = Bridge.poll()
@@ -376,12 +430,15 @@ class Service:
                     if self.ui_fg and self.core.seq != seq:
                         self.send_state()
                 now = time.time()
+                if self.core.cur is not None and now - last_pub > 20:
+                    last_pub = now
+                    self.core.dirty = True       # keep the notification / media card fresh
                 if self.ui_fg and now - self.last_send >= .25:
                     self.send_state()
                 if self.core.cur is None and now - self.last_act > 45:
                     self.shutdown()          # started (or restarted) with nothing to play
             except Exception:
-                log()
+                log("loop")
                 time.sleep(.2)
 
 
