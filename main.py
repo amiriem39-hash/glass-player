@@ -6,13 +6,17 @@ GLASS PLAYER - Kivy (Android)
 """
 import colorsys
 import base64
+import hashlib
 import io
+import json
 import math
 import os
 import random
 import re
+import socket
 import struct
 import threading
+import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 
@@ -36,9 +40,11 @@ from kivy.uix.floatlayout import FloatLayout
 from kivy.uix.recycleview.views import RecycleDataViewBehavior
 from kivy.uix.slider import Slider
 from kivy.uix.widget import Widget
-from kivy.uix.image import Image as KivyImage
+from kivy.uix.modalview import ModalView
 from kivy.uix.label import Label
 from kivy.utils import platform
+
+import playercore as pc
 
 try:
     from PIL import Image, ImageOps
@@ -58,8 +64,6 @@ except Exception:  # noqa
 EXTS = (".mp3", ".wav", ".ogg", ".flac", ".m4a", ".aac", ".opus")
 SKIP_DIRS = {"android", "lost.dir", "data", "obb"}
 MIN_SIZE = 1024 * 1024
-SONGS = []
-LOCK = threading.Lock()
 _AR = re.compile("[\u0600-\u06FF\u0750-\u077F\uFB50-\uFDFF\uFE70-\uFEFF]")
 
 
@@ -290,30 +294,81 @@ def read_tags(path):
     return title, artist or "Unknown artist"
 
 
-def scan():
-    found, seen = [], set()
-    # Query Android's public audio library using the runtime media permission.
-    # This avoids sending the user to the special "All files access" Settings page.
+# ---- persistent library cache: the list is on screen the moment the app opens
+def _cache_file():
+    return os.path.join(pc.data_dir(), "library.json")
+
+
+def _hidden_file():
+    return os.path.join(pc.data_dir(), "hidden.json")
+
+
+def _write_json(path, obj):
+    try:
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(obj, f, ensure_ascii=False)
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+
+def load_hidden():
+    try:
+        with open(_hidden_file(), encoding="utf-8") as f:
+            return set(json.load(f))
+    except Exception:
+        return set()
+
+
+def save_hidden(hidden):
+    _write_json(_hidden_file(), sorted(hidden))
+
+
+def load_cache(hidden):
+    try:
+        with open(_cache_file(), encoding="utf-8") as f:
+            raw = json.load(f)
+        return [{"path": r[0], "title": r[1], "artist": r[2], "mid": r[3],
+                 "size": r[4], "mt": r[5]} for r in raw if r[0] not in hidden]
+    except Exception:
+        return []
+
+
+def save_cache(songs):
+    _write_json(_cache_file(), [[s["path"], s["title"], s["artist"], s.get("mid"),
+                                 s.get("size"), s.get("mt")] for s in songs])
+
+
+def list_audio():
+    """Fast pass: only paths + file info, no tag reading."""
+    out, seen = [], set()
     if platform == "android":
         cursor = None
         try:
             from jnius import autoclass
             MediaAudio = autoclass("android.provider.MediaStore$Audio$Media")
             resolver = get_activity().getContentResolver()
-            cursor = resolver.query(MediaAudio.EXTERNAL_CONTENT_URI, None,
-                                    "is_music != 0", None, "title COLLATE NOCASE ASC")
+            cursor = resolver.query(MediaAudio.EXTERNAL_CONTENT_URI,
+                                    ["_id", "_data", "_size", "date_modified"],
+                                    "is_music != 0", None, None)
             if cursor:
-                data_col = cursor.getColumnIndex("_data")
+                i_id = cursor.getColumnIndex("_id")
+                i_data = cursor.getColumnIndex("_data")
+                i_size = cursor.getColumnIndex("_size")
+                i_mod = cursor.getColumnIndex("date_modified")
                 while cursor.moveToNext():
-                    if data_col >= 0:
-                        path = cursor.getString(data_col)
-                        if path and os.path.isfile(path):
-                            real = os.path.realpath(path)
-                            if real not in seen:
-                                seen.add(real)
-                                found.append(path)
+                    path = cursor.getString(i_data)
+                    if not path or not os.path.isfile(path):
+                        continue
+                    real = os.path.realpath(path)
+                    if real in seen:
+                        continue
+                    seen.add(real)
+                    out.append({"path": path, "mid": cursor.getLong(i_id),
+                                "size": cursor.getLong(i_size), "mt": cursor.getLong(i_mod)})
         except Exception:
-            found = []
+            out = []
         finally:
             try:
                 if cursor:
@@ -331,20 +386,46 @@ def scan():
                     p = os.path.join(dp_, f)
                     try:
                         rp = os.path.realpath(p)
-                        if rp in seen or os.path.getsize(p) < MIN_SIZE:
+                        st = os.stat(p)
+                        if rp in seen or st.st_size < MIN_SIZE:
                             continue
                         seen.add(rp)
-                        found.append(p)
+                        out.append({"path": p, "mid": None, "size": st.st_size,
+                                    "mt": int(st.st_mtime)})
                     except Exception:
                         pass
-    found.sort(key=lambda p: os.path.basename(p).lower())
-    songs = []
-    for i, p in enumerate(found):
-        t, a = read_tags(p)
-        songs.append({"id": i, "path": p, "title": t, "artist": a})
-    with LOCK:
-        SONGS[:] = songs
-    return len(songs)
+    out.sort(key=lambda d: os.path.basename(d["path"]).lower())
+    return out
+
+
+def scan(cache, hidden, publish=None):
+    """Songs whose size/mtime match the cache are reused (no tag reading);
+    only new or changed files are read. Interim lists are published so the UI
+    can show songs while the rest are still being read."""
+    songs, todo = [], []
+    for f in list_audio():
+        if f["path"] in hidden:
+            continue
+        c = cache.get(f["path"])
+        if c and c.get("size") == f["size"] and c.get("mt") == f["mt"] and c.get("title"):
+            t, a = c["title"], c.get("artist") or "Unknown artist"
+        else:
+            t, a = guess_names(f["path"])
+            a = a or "Unknown artist"
+            todo.append(len(songs))
+        songs.append({"path": f["path"], "title": t, "artist": a, "mid": f["mid"],
+                      "size": f["size"], "mt": f["mt"]})
+    if publish and todo:
+        publish([dict(s) for s in songs])
+    for k, i in enumerate(todo):
+        s = songs[i]
+        try:
+            s["title"], s["artist"] = read_tags(s["path"])
+        except Exception:
+            pass
+        if publish and (k + 1) % 250 == 0 and k + 1 < len(todo):
+            publish([dict(x) for x in songs])
+    return songs
 
 
 def read_cover(path):
@@ -387,13 +468,25 @@ def read_cover(path):
     return None
 
 
-# ------------------------------------------------------------ covers (texture cache)
+# ------------------------------------------------------------ covers (texture + disk cache)
+THUMBS = os.path.join(pc.data_dir(), "thumbs")
+try:
+    os.makedirs(THUMBS, exist_ok=True)
+except OSError:
+    pass
+
+
+def _thumb_path(path, size, mt):
+    h = hashlib.md5(("%s|%s|%d" % (path, mt, size)).encode("utf-8", "ignore")).hexdigest()
+    return os.path.join(THUMBS, h + ".jpg")
+
+
 class Covers:
     def __init__(self):
         self.cache = OrderedDict()
         self.pending = {}
         self.bytes = 0
-        self.ex = ThreadPoolExecutor(2)
+        self.ex = ThreadPoolExecutor(3)
 
     def clear(self):
         self.cache.clear()
@@ -411,26 +504,49 @@ class Covers:
         self.pending[key] = [cb]
         self.ex.submit(self._work, key)
 
+    def _load(self, path, size):
+        if not Image:
+            return None
+        try:
+            mt = int(os.path.getmtime(path))
+        except OSError:
+            mt = 0
+        tp = _thumb_path(path, size, mt)
+        if os.path.isfile(tp):                       # already extracted once: instant
+            im = Image.open(tp).convert("RGBA")
+        elif os.path.isfile(tp + ".no"):             # known to have no artwork
+            return None
+        else:
+            r = read_cover(path)
+            if not r:
+                try:
+                    open(tp + ".no", "wb").close()
+                except OSError:
+                    pass
+                return None
+            im = Image.open(io.BytesIO(r[0]))
+            try:
+                im.draft("RGB", (size * 2, size * 2))
+            except Exception:
+                pass
+            im = ImageOps.fit(im.convert("RGBA"), (size, size))
+            try:
+                im.convert("RGB").save(tp, "JPEG", quality=88)
+            except Exception:
+                pass
+        px = list(im.resize((8, 8)).convert("RGB").getdata())
+        rr = sum(p[0] for p in px) / 64.0
+        gg = sum(p[1] for p in px) / 64.0
+        bb = sum(p[2] for p in px) / 64.0
+        hue = None
+        if max(rr, gg, bb) - min(rr, gg, bb) >= 12:
+            hue = colorsys.rgb_to_hsv(rr / 255, gg / 255, bb / 255)[0] * 360
+        return (size, size, im.tobytes(), hue)
+
     def _work(self, key):
         path, size = key
-        res = None
         try:
-            r = read_cover(path)
-            if r and Image:
-                im = Image.open(io.BytesIO(r[0]))
-                try:
-                    im.draft("RGB", (size * 2, size * 2))
-                except Exception:
-                    pass
-                im = ImageOps.fit(im.convert("RGBA"), (size, size))
-                px = list(im.resize((8, 8)).convert("RGB").getdata())
-                rr = sum(p[0] for p in px) / 64.0
-                gg = sum(p[1] for p in px) / 64.0
-                bb = sum(p[2] for p in px) / 64.0
-                hue = None
-                if max(rr, gg, bb) - min(rr, gg, bb) >= 12:
-                    hue = colorsys.rgb_to_hsv(rr / 255, gg / 255, bb / 255)[0] * 360
-                res = (size, size, im.tobytes(), hue)
+            res = self._load(path, size)
         except Exception:
             res = None
         Clock.schedule_once(lambda dt: self._done(key, res))
@@ -454,152 +570,112 @@ class Covers:
             cb(*val)
 
 
-# ------------------------------------------------------------ audio engine
-if platform == "android":
-    from jnius import autoclass, PythonJavaClass, java_method
-    MediaPlayer = autoclass("android.media.MediaPlayer")
+# ------------------------------------------------------------ player link
+class Remote:
+    """UI side of the player.
+    Android: talks to the foreground service (service.py) over localhost UDP.
+    Desktop: runs the same PlayerCore in-process (testing only)."""
 
-    class _Done(PythonJavaClass):
-        __javainterfaces__ = ["android/media/MediaPlayer$OnCompletionListener"]
-        __javacontext__ = "app"
-
-        def __init__(self, cb):
-            super().__init__()
-            self.cb = cb
-
-        @java_method("(Landroid/media/MediaPlayer;)V")
-        def onCompletion(self, mp):
-            self.cb()
-
-    class _Err(PythonJavaClass):
-        __javainterfaces__ = ["android/media/MediaPlayer$OnErrorListener"]
-        __javacontext__ = "app"
-
-        def __init__(self, cb):
-            super().__init__()
-            self.cb = cb
-
-        @java_method("(Landroid/media/MediaPlayer;II)Z")
-        def onError(self, mp, what, extra):
-            self.cb()
-            return True
-
-    class Engine:
-        def __init__(self, on_end, on_err):
-            self.on_end, self.on_err = on_end, on_err
-            self.mp, self.gen, self._refs = None, 0, []
-
-        def release(self):
-            if self.mp:
-                try:
-                    self.mp.release()
-                except Exception:
-                    pass
-            self.mp = None
-
-        def play(self, path):
-            self.gen += 1
-            g = self.gen
-            self.release()
-            mp = None
+    def __init__(self, app):
+        self.app = app
+        self.local = None
+        self.sock = None
+        self.alive = False
+        self.pending = []
+        self.last = 0.0
+        self.last_hello = 0.0
+        self.started = 0.0
+        self.last_poll = 0.0
+        if platform == "android":
             try:
-                mp = MediaPlayer()
-                d = _Done(lambda: self.on_end(g))
-                e = _Err(lambda: Clock.schedule_once(lambda dt: self.on_err(g)))
-                self._refs = [d, e]
-                mp.setOnCompletionListener(d)
-                mp.setOnErrorListener(e)
-                try:
-                    mp.setWakeMode(get_activity().getApplicationContext(), 1)
-                except Exception:
-                    pass
-                mp.setDataSource(path)
-                mp.prepare()
-                mp.start()
-                self.mp = mp
-                return True
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s.bind(("127.0.0.1", pc.UI_PORT))
+                s.setblocking(False)
+                self.sock = s
             except Exception:
-                try:
-                    mp.release()
-                except Exception:
-                    pass
-                return False
+                self.sock = None
+        else:
+            self.local = pc.PlayerCore(None)
 
-        def _c(self, fn, default=0):
+    @property
+    def ready(self):
+        return self.local is not None or self.alive
+
+    def _tx(self, msg):
+        if self.sock:
             try:
-                return fn() if self.mp else default
+                self.sock.sendto(json.dumps(msg).encode("utf-8"),
+                                 ("127.0.0.1", pc.CMD_PORT))
             except Exception:
-                return default
+                pass
 
-        def pos(self):
-            return self._c(lambda: self.mp.getCurrentPosition() / 1000.0)
+    def hello(self, now=None):
+        self.last_hello = now or time.time()
+        self._tx({"c": "hello"})
 
-        def dur(self):
-            return self._c(lambda: max(0, self.mp.getDuration()) / 1000.0)
+    def notify(self, msg):
+        """Fire-and-forget (fg flag etc.); never starts the service."""
+        if self.local is None:
+            self._tx(msg)
 
-        def playing(self):
-            return bool(self._c(lambda: self.mp.isPlaying(), False))
+    def _launch(self):
+        now = time.time()
+        if now - self.started < 6:
+            return
+        self.started = now
+        try:
+            from jnius import autoclass
+            act = get_activity()
+            autoclass(act.getPackageName() + ".ServicePlayer").start(act, "")
+        except Exception:
+            self.app.toast("Player service failed to start")
 
-        def pause(self):
-            self._c(lambda: self.mp.pause())
+    def send(self, msg, start=False):
+        if self.local is not None:
+            self.local.handle(msg)
+        elif self.alive:
+            self._tx(msg)
+        elif start:
+            self.pending.append(msg)
+            del self.pending[:-6]
+            self._launch()
+            self.hello()
 
-        def resume(self):
-            self._c(lambda: self.mp.start())
-
-        def seek(self, sec):
-            self._c(lambda: self.mp.seekTo(int(sec * 1000)))
-else:
-    from kivy.core.audio import SoundLoader
-
-    class Engine:  # desktop fallback (testing only)
-        def __init__(self, on_end, on_err):
-            self.on_end, self.on_err = on_end, on_err
-            self.s, self.gen, self._m, self._p = None, 0, False, 0
-
-        def release(self):
-            if self.s:
-                self._m = True
-                self.s.stop()
-                self._m = False
-            self.s = None
-
-        def play(self, path):
-            self.gen += 1
-            g = self.gen
-            self.release()
-            s = SoundLoader.load(path)
-            if not s:
-                return False
-            s.bind(on_stop=lambda *a: (not self._m) and g == self.gen and
-                   Clock.schedule_once(lambda dt: self.on_end(g)))
-            s.play()
-            self.s = s
-            return True
-
-        def pos(self):
-            return self.s.get_pos() if self.s else 0
-
-        def dur(self):
-            return (self.s.length or 0) if self.s else 0
-
-        def playing(self):
-            return bool(self.s and self.s.state == "play")
-
-        def pause(self):
-            if self.s:
-                self._p = self.pos()
-                self._m = True
-                self.s.stop()
-                self._m = False
-
-        def resume(self):
-            if self.s:
-                self.s.play()
-                self.s.seek(self._p)
-
-        def seek(self, sec):
-            if self.s:
-                self.s.seek(sec)
+    def pump(self, now):
+        """Returns the list of messages that arrived since the last call."""
+        out = []
+        if self.local is not None:
+            self.local.poll()
+            if now - self.last_poll >= .25:
+                self.last_poll = now
+                st = self.local.state()
+                st["e"] = "state"
+                out.append(st)
+            return out
+        if not self.sock:
+            return out
+        while True:
+            try:
+                data, _a = self.sock.recvfrom(65535)
+            except (BlockingIOError, InterruptedError, OSError):
+                break
+            try:
+                m = json.loads(data.decode("utf-8"))
+            except Exception:
+                continue
+            self.last = now
+            if not self.alive:
+                self.alive = True
+                for p in self.pending:
+                    self._tx(p)
+                self.pending = []
+            out.append(m)
+        if self.alive and now - self.last > 3.0:
+            self.alive = False
+        if not self.alive and self.pending and now - self.last_hello > .6:
+            self.hello(now)
+        return out
 
 
 # ------------------------------------------------------------ widgets
@@ -638,6 +714,18 @@ def draw_icon(k, cx, cy, sz, col):
         L((7.5, 13.5), (4.5, 16), (7.5, 18.5))
         if k == "repeat1":
             L((10.8, 11), (12.5, 10), (12.5, 14))
+    elif k == "close":
+        L((6, 6), (18, 18))
+        L((18, 6), (6, 18))
+    elif k == "trash":
+        L((4.5, 7), (19.5, 7))
+        L((9, 7), (9, 4.5), (15, 4.5), (15, 7))
+        L((6.5, 7), (7.7, 19.5), (16.3, 19.5), (17.5, 7))
+        L((10.3, 10.5), (10.3, 16.5))
+        L((13.7, 10.5), (13.7, 16.5))
+    elif k == "all":
+        L((2.5, 13), (6.5, 17), (13.5, 8))
+        L((10, 16), (11, 17), (21, 7))
     elif k == "refresh":
         Line(circle=(cx, cy, 8 * u, 20, 330), width=w, cap="round")
         a = math.radians(330)
@@ -755,10 +843,12 @@ class Backdrop(Widget):
 
 class Halo(Widget):
     scale = NumericProperty(0)
+    ox = NumericProperty(0)
+    oy = NumericProperty(0)
 
     def __init__(self, **kw):
         super().__init__(**kw)
-        self.bind(pos=self.draw, size=self.draw, scale=self.draw)
+        self.bind(pos=self.draw, size=self.draw, scale=self.draw, ox=self.draw, oy=self.draw)
         App.get_running_app().bind(c1=self.draw)
         self.draw()
 
@@ -770,7 +860,8 @@ class Halo(Widget):
             for i in range(8):
                 r = min(self.size) * .5 * (1 - i / 8.0) * k
                 Color(c[0], c[1], c[2], .07)
-                Ellipse(pos=(self.center_x - r, self.center_y - r), size=(2 * r, 2 * r))
+                Ellipse(pos=(self.center_x + self.ox - r, self.center_y + self.oy - r),
+                        size=(2 * r, 2 * r))
 
 
 class Disc(Widget):
@@ -885,24 +976,28 @@ class Seek(Slider):
         app = App.get_running_app()
         if app.drag:
             app.drag = False
-            app.engine.seek(self.value / 1000.0 * app.engine.dur())
+            app.seek_frac(self.value / 1000.0)
         return r
 
     def on_value(self, *a):
         app = App.get_running_app()
         if app.drag:
-            app.t0 = fmt(self.value / 1000.0 * app.engine.dur())
+            app.t0 = fmt(self.value / 1000.0 * app.r_dur)
 
 
 class Stage(FloatLayout):
-    tx = NumericProperty(0)
+    tx = NumericProperty(0)      # finger tilt   (-1..1)
     ty = NumericProperty(0)
+    px = NumericProperty(0)      # final tilt = phone sensor + finger
+    py = NumericProperty(0)
+    bob = NumericProperty(0)     # gentle floating motion
 
     def _tilt(self, t):
         rx = (t.x - self.x) / max(1, self.width) - .5
         ry = (t.y - self.y) / max(1, self.height) - .5
         Animation.cancel_all(self, "tx", "ty")
-        self.tx, self.ty = rx * 34, -ry * 34
+        self.tx = max(-1, min(1, rx * 2.4))
+        self.ty = max(-1, min(1, ry * 2.4))
 
     def on_touch_down(self, t):
         if self.collide_point(*t.pos):
@@ -920,9 +1015,38 @@ class Stage(FloatLayout):
     def on_touch_up(self, t):
         if t.grab_current is self:
             t.ungrab(self)
-            Animation(tx=0, ty=0, d=.35, t="out_cubic").start(self)
+            Animation(tx=0, ty=0, d=.45, t="out_cubic").start(self)
             return True
         return super().on_touch_up(t)
+
+
+class Sheen(Widget):
+    """Glossy light band that slides across the cover as the phone tilts."""
+    k = NumericProperty(0)
+    rad = NumericProperty(dp(30))
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        t = Texture.create(size=(64, 1), colorfmt="rgba")
+        buf = bytearray()
+        for i in range(64):
+            d = abs(i / 63.0 - .5) / .16
+            a = (max(0.0, 1.0 - d) ** 2) * .34
+            buf += bytes((255, 255, 255, int(a * 255)))
+        t.blit_buffer(bytes(buf), colorfmt="rgba", bufferfmt="ubyte")
+        t.mag_filter = t.min_filter = "linear"
+        self.tex = t
+        self.bind(pos=self.draw, size=self.draw, k=self.draw)
+        self.draw()
+
+    def draw(self, *a):
+        u0 = -self.k * .5
+        self.canvas.clear()
+        with self.canvas:
+            Color(1, 1, 1, 1)
+            RoundedRectangle(pos=self.pos, size=self.size, radius=[self.rad],
+                             texture=self.tex,
+                             tex_coords=(u0, 0, u0 + 1, 0, u0 + 1, 1, u0, 1))
 
 
 class Sheet(FloatLayout):
@@ -939,12 +1063,14 @@ class Sheet(FloatLayout):
 
     def show(self):
         self.opened = True
+        App.get_running_app().tilt_enable(True)
         self.opacity = 1
         Animation.cancel_all(self, "y")
         Animation(y=0, d=.45, t="out_cubic").start(self)
 
     def hide(self):
         self.opened = False
+        App.get_running_app().tilt_enable(False)
         Animation.cancel_all(self, "y")
         a = Animation(y=-self.height * 1.05, d=.35, t="in_cubic")
         a.bind(on_complete=lambda *x: None if self.opened else setattr(self, "opacity", 0))
@@ -969,14 +1095,57 @@ class SongRow(RecycleDataViewBehavior, ButtonBehavior, Glass):
     hue = NumericProperty(0)
     ha = StringProperty("left")
     cur = BooleanProperty(False)
+    sel = BooleanProperty(False)
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.long_fired = False
+        self._lp_ev = None
+        self._lp_y = 0
 
     def refresh_view_attrs(self, rv, index, data):
         super().refresh_view_attrs(rv, index, data)
         self.ids.cov.set_cover(self.path, 160)
 
+    def _cancel_lp(self):
+        if self._lp_ev:
+            self._lp_ev.cancel()
+            self._lp_ev = None
+
+    def _lp(self, dt):
+        self._lp_ev = None
+        self.long_fired = True
+        App.get_running_app().row_long(self)
+
+    def on_touch_down(self, t):
+        if self.collide_point(*t.pos):
+            self.long_fired = False
+            self._lp_y = t.y
+            self._cancel_lp()
+            self._lp_ev = Clock.schedule_once(self._lp, .5)
+        return super().on_touch_down(t)
+
+    def on_touch_move(self, t):
+        if self._lp_ev and abs(t.y - self._lp_y) > dp(12):
+            self._cancel_lp()
+        return super().on_touch_move(t)
+
+    def on_touch_up(self, t):
+        self._cancel_lp()
+        return super().on_touch_up(t)
+
 
 class Root(FloatLayout):
     pass
+
+
+class TxtBtn(ButtonBehavior, Label):
+    bgc = ListProperty([1, 1, 1, .12])
+
+
+class Confirm(ModalView):
+    title = StringProperty("")
+    msg = StringProperty("")
 
 
 KV = r'''
@@ -1047,10 +1216,10 @@ KV = r'''
     spacing: dp(12)
     rad: dp(22)
     fill: .09
-    on_release: app.play_view(self.idx)
+    on_release: app.row_tap(self)
     canvas.after:
         Color:
-            rgba: app.c2[0], app.c2[1], app.c2[2], (.9 if self.cur else 0)
+            rgba: app.c2[0], app.c2[1], app.c2[2], (.9 if (self.cur or self.sel) else 0)
         Line:
             rounded_rectangle: (self.x, self.y, self.width, self.height, self.rad)
             width: dp(1.2)
@@ -1086,6 +1255,30 @@ KV = r'''
         size: dp(26), dp(18)
         pos_hint: {'center_y': .5}
         active: root.cur
+        opacity: 0 if app.sel_mode else 1
+    Widget:
+        size_hint: None, None
+        size: dp(26), dp(26)
+        pos_hint: {'center_y': .5}
+        opacity: 1 if app.sel_mode else 0
+        canvas:
+            Color:
+                rgba: (app.c2[0], app.c2[1], app.c2[2], 1) if root.sel else (1, 1, 1, .4)
+            Line:
+                circle: self.center_x, self.center_y, dp(11)
+                width: dp(1.6)
+            Color:
+                rgba: app.c2[0], app.c2[1], app.c2[2], (1 if root.sel else 0)
+            Ellipse:
+                pos: self.center_x - dp(11), self.center_y - dp(11)
+                size: dp(22), dp(22)
+            Color:
+                rgba: 0, 0, 0, (1 if root.sel else 0)
+            Line:
+                points: [self.center_x - dp(5), self.center_y, self.center_x - dp(1.5), self.center_y - dp(4), self.center_x + dp(5), self.center_y + dp(4)]
+                width: dp(1.8)
+                cap: 'round'
+                joint: 'round'
 
 <Mini>:
     rad: dp(26)
@@ -1142,10 +1335,26 @@ KV = r'''
         on_release: app.toggle()
 
 <Stage>:
+    canvas.before:
+        PushMatrix
+        Translate:
+            xy: self.px * dp(12), self.bob + self.py * dp(8)
+        Rotate:
+            angle: self.px * 15
+            axis: 0, 1, 0
+            origin: self.center
+        Rotate:
+            angle: -self.py * 12
+            axis: 1, 0, 0
+            origin: self.center
+    canvas.after:
+        PopMatrix
     Halo:
         size_hint: 1.32, 1.32
         pos_hint: {'center_x': .5, 'center_y': .5}
         scale: app.bass
+        ox: -root.px * dp(24)
+        oy: root.py * dp(14)
     CoverBox:
         id: cov
         size_hint: .94, .94
@@ -1153,6 +1362,11 @@ KV = r'''
         rad: dp(30)
         hue: app.cur_hue
         letter: app.cur_letter
+    Sheen:
+        size_hint: .94, .94
+        pos_hint: {'center_x': .5, 'center_y': .5}
+        rad: dp(30)
+        k: root.px
     Widget:
         size_hint: .94, .94
         pos_hint: {'center_x': .5, 'center_y': .5}
@@ -1305,12 +1519,6 @@ KV = r'''
             size_hint_y: None
             height: dp(62)
             padding: dp(16), 0
-            Image:
-                source: app.logo_path
-                size_hint: None, None
-                size: dp(46), dp(46)
-                allow_stretch: True
-                keep_ratio: True
             BoxLayout:
                 orientation: 'vertical'
                 Label:
@@ -1334,7 +1542,7 @@ KV = r'''
                 size_hint: None, None
                 size: dp(42), dp(42)
                 pos_hint: {'center_y': .5}
-                on_release: app.rescan()
+                on_release: app.rescan(False, True)
         BoxLayout:
             size_hint_y: None
             height: dp(58)
@@ -1368,11 +1576,52 @@ KV = r'''
                 spacing: dp(10)
                 padding: dp(14), dp(6), dp(14), dp(130)
     Label:
-        text: 'No songs found.\nAllow music access when asked,\nthen tap refresh.'
+        text: app.empty_text
         halign: 'center'
         color: 1, 1, 1, .6
         pos_hint: {'center_x': .5, 'center_y': .45}
         opacity: 0 if app.nsongs else 1
+    BoxLayout:
+        size_hint: 1, None
+        height: dp(70)
+        pos_hint: {'x': 0, 'top': 1}
+        padding: dp(14), dp(12), dp(14), dp(8)
+        spacing: dp(10)
+        opacity: 1 if app.sel_mode else 0
+        disabled: not app.sel_mode
+        canvas.before:
+            Color:
+                rgba: .04, .03, .09, 1
+            Rectangle:
+                pos: self.pos
+                size: self.size
+        GBtn:
+            kind: 'close'
+            style: 'glass'
+            isz: .5
+            size_hint: None, None
+            size: dp(44), dp(44)
+            on_release: app.sel_clear()
+        Label:
+            text: app.sel_text
+            font_size: sp(18)
+            halign: 'left'
+            valign: 'middle'
+            text_size: self.size
+        GBtn:
+            kind: 'all'
+            style: 'glass'
+            isz: .5
+            size_hint: None, None
+            size: dp(44), dp(44)
+            on_release: app.sel_all()
+        GBtn:
+            kind: 'trash'
+            style: 'accent'
+            isz: .5
+            size_hint: None, None
+            size: dp(44), dp(44)
+            on_release: app.ask_delete()
     Mini:
         id: mini
         size_hint: None, None
@@ -1389,13 +1638,82 @@ KV = r'''
         size: self.texture_size[0] + dp(32), dp(40)
         pos_hint: {'center_x': .5, 'top': .96}
         opacity: 0
+<TxtBtn>:
+    size_hint_y: None
+    height: dp(48)
+    font_size: sp(15)
+    canvas.before:
+        Color:
+            rgba: self.bgc[0], self.bgc[1], self.bgc[2], self.bgc[3] + (.14 if self.state == 'down' else 0)
+        RoundedRectangle:
+            pos: self.pos
+            size: self.size
+            radius: [dp(16)]
+
+<Confirm>:
+    size_hint: .9, None
+    height: dp(340)
+    background: ''
+    background_color: 0, 0, 0, 0
+    overlay_color: 0, 0, 0, .65
+    BoxLayout:
+        orientation: 'vertical'
+        padding: dp(20)
+        spacing: dp(10)
+        canvas.before:
+            Color:
+                rgba: .08, .06, .16, .97
+            RoundedRectangle:
+                pos: self.pos
+                size: self.size
+                radius: [dp(26)]
+            Color:
+                rgba: 1, 1, 1, .2
+            Line:
+                rounded_rectangle: (self.x, self.y, self.width, self.height, dp(26))
+                width: 1
+        Label:
+            text: root.title
+            font_size: sp(20)
+            size_hint_y: None
+            height: dp(34)
+        Label:
+            text: root.msg
+            font_size: sp(13)
+            color: 1, 1, 1, .72
+            text_size: self.size
+            halign: 'center'
+            valign: 'middle'
+        TxtBtn:
+            text: 'Delete from phone'
+            bgc: .95, .25, .3, .85
+            on_release: root.dismiss(); app.do_delete(True)
+        TxtBtn:
+            text: 'Remove from list only'
+            on_release: root.dismiss(); app.do_delete(False)
+        TxtBtn:
+            text: 'Cancel'
+            bgc: 1, 1, 1, .05
+            on_release: root.dismiss()
 '''
 
 
 # ------------------------------------------------------------ app
+DEL_REQ = 7311
+
+
+def prep(s):
+    """Display-ready strings for a song dict (Persian shaping, colour, letter)."""
+    if "td" not in s:
+        s["td"], s["ad"] = fa(s["title"]), fa(s["artist"])
+        s["hue"] = hue_of(s["title"])
+        s["rtl"] = bool(_AR.search(s["title"]))
+        s["letter"] = (s["title"] or "\u266a")[0]
+    return s
+
+
 class GlassApp(App):
     title = "DCED Plyer"
-    player_art_path = StringProperty("")
     c1 = ListProperty([.486, .302, 1, 1])
     c2 = ListProperty([0, .898, 1, 1])
     has_song = BooleanProperty(False)
@@ -1407,33 +1725,42 @@ class GlassApp(App):
     cur_letter = StringProperty("")
     cur_hue = NumericProperty(0)
     count_text = StringProperty("loading...")
+    empty_text = StringProperty("Loading your music...")
     nsongs = NumericProperty(0)
     t0 = StringProperty("0:00")
     t1 = StringProperty("0:00")
     frac = NumericProperty(0)
     eqt = NumericProperty(0)
     bass = NumericProperty(0)
+    sel_mode = BooleanProperty(False)
+    sel_text = StringProperty("")
 
     def build(self):
         setup_font()
         Window.clearcolor = (.03, .024, .07, 1)
         Window.softinput_mode = "below_target"
         self.songs, self.view, self.q = [], [], ""
-        self.logo_path, self.player_art_path = self._prepare_artwork()
-        self.icon = self.logo_path
-        self._notification_ready = False
-        self._media_session = None
-        self._bg_song = None
-        self._logo_bmp = None
+        self.by_path = {}
+        self.selected = set()
+        self.hidden = load_hidden()
         self.fg = True
-        self.raw_title = self.raw_artist = ""
         self.cur_path = None
-        self.hue, self.t, self.ang, self.errs = 260, 0.0, 0.0, 0
+        self.hue, self.t, self.ang = 260, 0.0, 0.0
         self.bars = [0.0] * 44
         self.drag = False
-        self._last_notification_update = 0.0
+        self.r_pos = self.r_dur = 0.0
+        self.r_t = time.time()
+        self.play_lock = 0.0
+        self.queue_dirty = True
+        self._scanning = False
+        self._scanned_once = False
+        self._acc = None
+        self._acc_on = False
+        self._pitch = None
+        self.tilt_x = self.tilt_y = 0.0
+        self._del_paths = []
         self.covers = Covers()
-        self.engine = Engine(self.on_end_raw, self.on_err)
+        self.remote = Remote(self)
         Window.bind(on_keyboard=self.on_key)
         Builder.load_string(KV)
         return Root()
@@ -1443,29 +1770,29 @@ class GlassApp(App):
         self.sheet, self.rv, self.mini = ids.sheet, ids.rv, ids.mini
         self.sk = self.sheet.ids.sk
         self.viz = self.sheet.ids.viz
-        self.stage_cov = self.sheet.ids.stage.ids.cov
-        try:   # app logo is the fallback cover when a song has no artwork
-            tex = CoreImage(self.logo_path).texture if self.logo_path else None
-            self.stage_cov.fallback = tex
-            self.mini.ids.cov.fallback = tex
-        except Exception:
-            pass
+        self.stage = self.sheet.ids.stage
+        # 1) the saved library is on screen immediately - never an empty list
+        cached = load_cache(self.hidden)
+        if cached:
+            self.songs = cached
+            self._index()
+            self.refresh()
+            self.empty_text = ""
         Clock.schedule_interval(self.tick, 1 / 24.)
         self.show_welcome()
+        # 2) re-attach to the playback service if music is already running
+        self.remote.hello()
         if platform == "android":
-            self.init_media_notification()
-            Clock.schedule_once(lambda dt: self.request_audio_permissions(), 1.4)
+            try:
+                from android import activity
+                activity.bind(on_activity_result=self._on_activity_result)
+            except Exception:
+                pass
+            if self.have_audio_perm():
+                self.rescan(True)
+            Clock.schedule_once(lambda dt: self.request_audio_permissions(), .8)
         else:
-            self.rescan()
-
-    def _prepare_artwork(self):
-        """The app icon doubles as logo (header, notification, cover fallback)."""
-        here = os.path.dirname(os.path.abspath(__file__))
-        for n in ("icon.png", "icon.jpg"):
-            p = os.path.join(here, n)
-            if os.path.isfile(p):
-                return p, p
-        return "", ""
+            self.rescan(True)
 
     # ---- welcome: glass panel, no image, techno font
     def show_welcome(self):
@@ -1481,14 +1808,14 @@ class GlassApp(App):
                           padding=(dp(26), dp(26)), spacing=dp(10))
         R = dp(34)
         with panel.canvas.before:
-            Color(1, 1, 1, 1)                             # colour tint, left -> right
+            Color(1, 1, 1, 1)
             panel._g1 = RoundedRectangle(
                 pos=panel.pos, size=panel.size, radius=[R],
                 texture=grad_tex(self.c1[:3] + [.34], self.c2[:3] + [.28]))
-            panel._glass = RoundedRectangle(              # frosted body, light from the top
+            panel._glass = RoundedRectangle(
                 pos=panel.pos, size=panel.size, radius=[R],
                 texture=grad_tex((1, 1, 1, .20), (1, 1, 1, .03), True))
-            Color(1, 1, 1, .34)                           # glass edge
+            Color(1, 1, 1, .34)
             panel._edge = Line(rounded_rectangle=(panel.x, panel.y, panel.width,
                                                   panel.height, R), width=1.2)
 
@@ -1518,14 +1845,14 @@ class GlassApp(App):
         loop.start(shim)
         overlay._shim = shim
         panel.opacity = 0
-        Animation(opacity=1, d=.45, t="out_quad").start(panel)
+        Animation(opacity=1, d=.4, t="out_quad").start(panel)
         overlay.opacity = 0
-        Animation(opacity=1, d=.3, t="out_quad").start(overlay)
-        Clock.schedule_once(lambda dt: self._hide_welcome(overlay), 2.7)
+        Animation(opacity=1, d=.25, t="out_quad").start(overlay)
+        Clock.schedule_once(lambda dt: self._hide_welcome(overlay), 2.0)
 
     def _hide_welcome(self, overlay):
         Animation.cancel_all(overlay._shim)
-        anim = Animation(opacity=0, d=.4, t="in_quad")
+        anim = Animation(opacity=0, d=.35, t="in_quad")
         anim.bind(on_complete=lambda *_: self.root.remove_widget(overlay)
                   if overlay.parent else None)
         anim.start(overlay)
@@ -1559,8 +1886,8 @@ class GlassApp(App):
             ok = True
         if not ok:
             self.toast("Allow music access to see your songs")
-        self.rescan(True)
-        self.update_media_notification()
+        if not self.songs or not self._scanned_once:
+            self.rescan(True)
 
     def have_audio_perm(self):
         try:
@@ -1569,208 +1896,31 @@ class GlassApp(App):
         except Exception:
             return True
 
-    # ---- media notification (works with its own buttons, no app launch)
-    def init_media_notification(self):
-        if platform != "android":
-            return
-        try:
-            from jnius import autoclass
-            from android.broadcast import BroadcastReceiver
-            sdk = autoclass("android.os.Build$VERSION").SDK_INT
-            act = get_activity()
-            self._ctx = act.getApplicationContext()
-            self._pkg = self._ctx.getPackageName()
-            self._manager = self._ctx.getSystemService("notification")
-            if sdk >= 26:
-                Channel = autoclass("android.app.NotificationChannel")
-                channel = Channel("dced_music", "DCED Plyer playback", 2)
-                channel.setDescription("Music playback controls")
-                self._manager.createNotificationChannel(channel)
-            MediaSession = autoclass("android.media.session.MediaSession")
-            self._media_session = MediaSession(self._ctx, "DCED Plyer")
-            self._media_session.setFlags(3)
-            self._media_session.setActive(True)
-            self._acts = {self._pkg + ".PLAYPAUSE": "toggle",
-                          self._pkg + ".NEXT": "next",
-                          self._pkg + ".PREV": "previous"}
-            self._br = BroadcastReceiver(self._on_broadcast, actions=list(self._acts))
-            self._br.start()
-            if self.logo_path:
-                try:
-                    self._logo_bmp = autoclass("android.graphics.BitmapFactory").decodeFile(
-                        self.logo_path)
-                except Exception:
-                    self._logo_bmp = None
-            self._notification_ready = True
-            self.update_media_notification()
-        except Exception:
-            self._notification_ready = False
-
-    def _on_broadcast(self, context, intent):
-        """Runs on an Android thread."""
-        a = self._acts.get(intent.getAction())
-        if not a:
-            return
-        if self.fg:
-            Clock.schedule_once(lambda dt: self.ui_action(a), 0)
-        else:
-            threading.Thread(target=self.bg_action, args=(a,), daemon=True).start()
-
-    def ui_action(self, a):
-        if a == "toggle":
-            self.toggle()
-        elif a == "next":
-            self.go_next()
-        elif a == "previous":
-            self.go_prev()
-
-    def update_media_notification(self, playing=None):
-        if (platform != "android" or not getattr(self, "_notification_ready", False)
-                or not self.cur_path):
-            return
-        if playing is None:
-            playing = self.playing
-        try:
-            from jnius import autoclass
-            MetadataBuilder = autoclass("android.media.MediaMetadata$Builder")
-            PlaybackStateClass = autoclass("android.media.session.PlaybackState")
-            PlaybackBuilder = autoclass("android.media.session.PlaybackState$Builder")
-            NotificationBuilder = autoclass("android.app.Notification$Builder")
-            MediaStyle = autoclass("android.app.Notification$MediaStyle")
-            PendingIntent = autoclass("android.app.PendingIntent")
-            Intent = autoclass("android.content.Intent")
-            RDrawable = autoclass("android.R$drawable")
-            title = self.raw_title or "DCED Plyer"       # raw text: Android shapes Persian itself
-            artist = self.raw_artist or ""
-            metadata = (MetadataBuilder()
-                        .putString("android.media.metadata.TITLE", title)
-                        .putString("android.media.metadata.ARTIST", artist).build())
-            self._media_session.setMetadata(metadata)
-            position = int(self.engine.pos() * 1000)
-            actions = (PlaybackStateClass.ACTION_PLAY | PlaybackStateClass.ACTION_PAUSE |
-                       PlaybackStateClass.ACTION_PLAY_PAUSE |
-                       PlaybackStateClass.ACTION_SKIP_TO_NEXT |
-                       PlaybackStateClass.ACTION_SKIP_TO_PREVIOUS |
-                       PlaybackStateClass.ACTION_SEEK_TO)
-            playback = (PlaybackBuilder().setActions(actions)
-                        .setState(3 if playing else 2, position, 1.0 if playing else 0.0).build())
-            self._media_session.setPlaybackState(playback)
-
-            flags = PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE
-
-            def pending(name, code):
-                i = Intent(self._pkg + "." + name)
-                i.setPackage(self._pkg)
-                return PendingIntent.getBroadcast(self._ctx, code, i, flags)
-
-            launch = self._ctx.getPackageManager().getLaunchIntentForPackage(self._pkg)
-            sdk = autoclass("android.os.Build$VERSION").SDK_INT
-            builder = (NotificationBuilder(self._ctx, "dced_music")
-                       if sdk >= 26 else NotificationBuilder(self._ctx))
-            builder.setContentTitle(title).setContentText(artist)
-            builder.setSmallIcon(RDrawable.ic_media_play)
-            builder.setOngoing(bool(playing)).setOnlyAlertOnce(True)
-            builder.setVisibility(1)
-            if launch is not None:
-                builder.setContentIntent(
-                    PendingIntent.getActivity(self._ctx, 10, launch, flags))
-            if getattr(self, "_logo_bmp", None):
-                builder.setLargeIcon(self._logo_bmp)
-            builder.addAction(RDrawable.ic_media_previous, "Previous", pending("PREV", 11))
-            builder.addAction(RDrawable.ic_media_pause if playing else RDrawable.ic_media_play,
-                              "Play/Pause", pending("PLAYPAUSE", 12))
-            builder.addAction(RDrawable.ic_media_next, "Next", pending("NEXT", 13))
-            style = MediaStyle()
-            style.setMediaSession(self._media_session.getSessionToken())
-            style.setShowActionsInCompactView([0, 1, 2])
-            builder.setStyle(style)
-            self._manager.notify(7401, builder.build())
-        except Exception:
-            pass
-
-    # ---- background playback: no Kivy properties are touched off the UI thread
-    def bg_action(self, a):
-        if a == "toggle":
-            if self.engine.playing():
-                self.engine.pause()
-            else:
-                self.engine.resume()
-            Clock.schedule_once(lambda dt: self.sync_ui(), 0)
-            self.update_media_notification(self.engine.playing())
-        elif a == "next":
-            self.bg_step(1)
-        elif a == "previous":
-            if self.engine.pos() > 3:
-                self.engine.seek(0)
-            else:
-                self.bg_step(-1)
-
-    def bg_step(self, step):
-        view = list(self.view)
-        if not view:
-            return
-        i = next((k for k, s in enumerate(view) if s["path"] == self.cur_path), -1)
-        if step > 0 and self.shuffle:
-            j = random.randrange(len(view))
-        else:
-            j = (max(i, 0) + step) % len(view)
-        s = view[j]
-        self.cur_path = s["path"]
-        self.raw_title, self.raw_artist = s["title"], s["artist"]
-        ok = self.engine.play(s["path"])
-        self._bg_song = s
-        self.update_media_notification(ok)
-        Clock.schedule_once(lambda dt: self.sync_ui(), 0)
-
-    def bg_on_end(self, gen):
-        if gen != self.engine.gen:
-            return
-        if self.repeat == 2:
-            self.engine.seek(0)
-            self.engine.resume()
-            return
-        i = next((k for k, s in enumerate(self.view) if s["path"] == self.cur_path), -1)
-        if self.repeat == 1 or self.shuffle or i < len(self.view) - 1:
-            self.bg_step(1)
-        else:
-            self.update_media_notification(False)
-            Clock.schedule_once(lambda dt: self.sync_ui(), 0)
-
-    def sync_ui(self):
-        s = getattr(self, "_bg_song", None)
-        if s is not None:
-            self._bg_song = None
-            self.apply_song_ui(s)
-        self.playing = self.engine.playing()
-
-    def handle_media_intent(self):
-        pass
-
+    # ---- lifecycle: the service keeps playing, we only tell it whether we are visible
     def on_pause(self):
         self.fg = False
+        self.remote.notify({"c": "fg", "v": 0})
+        self.tilt_enable(False)
         return True
 
     def on_resume(self):
         self.fg = True
-        self.sync_ui()
+        self.remote.last = time.time()
+        self.remote.hello()
+        if self.sheet.opened:
+            self.tilt_enable(True)
         if not self.songs:
             self.rescan()
 
     def on_stop(self):
-        self.engine.release()
-        try:
-            if getattr(self, "_manager", None):
-                self._manager.cancel(7401)
-            if getattr(self, "_br", None):
-                self._br.stop()
-            if self._media_session:
-                self._media_session.setActive(False)
-                self._media_session.release()
-        except Exception:
-            pass
+        self.remote.notify({"c": "fg", "v": 0})
+        self.tilt_enable(False)      # music + notification live on in the service
 
     def on_key(self, win, key, *a):
         if key == 27:
+            if self.sel_mode:
+                self.sel_clear()
+                return True
             if self.sheet.opened:
                 self.sheet.hide()
                 return True
@@ -1783,23 +1933,52 @@ class GlassApp(App):
         return False
 
     # ---- library
-    def rescan(self, first=False):
+    def _index(self):
+        self.by_path = {s["path"]: s for s in self.songs}
+        self.selected &= set(self.by_path)
+
+    def rescan(self, first=False, restore=False):
+        if self._scanning:
+            return
         if platform == "android" and not first and not self.have_audio_perm():
             self.request_audio_permissions()
             return
-        self.toast("Scanning...")
-        threading.Thread(target=self._scan_job, args=(first,), daemon=True).start()
+        if restore:
+            self.hidden.clear()
+            save_hidden(self.hidden)
+        self._scanning = True
+        if self.songs:
+            self.toast("Scanning...")
+        else:
+            self.empty_text = "Loading your music..."
+        cache = {s["path"]: s for s in self.songs}
+        hidden = set(self.hidden)
+        threading.Thread(target=self._scan_job, args=(cache, hidden), daemon=True).start()
 
-    def _scan_job(self, first):
-        n = scan()
-        Clock.schedule_once(lambda dt: self._scanned(n, first))
+    def _scan_job(self, cache, hidden):
+        def publish(songs):
+            Clock.schedule_once(lambda dt: self._scanned(songs, False))
+        try:
+            songs = scan(cache, hidden, publish)
+        except Exception:
+            songs = None
+        Clock.schedule_once(lambda dt: self._scanned(songs, True))
+        if songs is not None:
+            save_cache(songs)
 
-    def _scanned(self, n, first):
-        self.covers.clear()
-        with LOCK:
-            self.songs = list(SONGS)
-        self.refresh()
-        self.toast("%d songs found" % n)
+    def _scanned(self, songs, final):
+        if final:
+            self._scanning = False
+            self._scanned_once = True
+        if songs is not None:
+            self.songs = songs
+            self._index()
+            self.refresh()
+        if final:
+            self.empty_text = ("" if self.songs else
+                               "No songs found.\nAllow music access when asked,\nthen tap refresh.")
+            if songs is not None:
+                self.toast("%d songs found" % len(songs))
 
     def set_query(self, text):
         self.q = text.strip().lower()
@@ -1808,17 +1987,15 @@ class GlassApp(App):
     def refresh(self):
         q = self.q
         self.view = [s for s in self.songs if q in (s["title"] + " " + s["artist"]).lower()]
+        self.queue_dirty = True
         data = []
         for i, s in enumerate(self.view):
-            if "td" not in s:
-                s["td"], s["ad"] = fa(s["title"]), fa(s["artist"])
-                s["hue"] = hue_of(s["title"])
-                s["rtl"] = bool(_AR.search(s["title"]))
-                s["letter"] = (s["title"] or "\u266a")[0]
+            prep(s)
             data.append({"idx": i, "path": s["path"], "title": s["td"], "artist": s["ad"],
                          "letter": s["letter"], "hue": s["hue"],
                          "ha": "right" if s["rtl"] else "left",
-                         "cur": s["path"] == self.cur_path})
+                         "cur": s["path"] == self.cur_path,
+                         "sel": s["path"] in self.selected})
         self.rv.data = data
         self.nsongs = len(self.songs)
         self.count_text = "%d songs" % len(self.songs)
@@ -1834,6 +2011,155 @@ class GlassApp(App):
                 return i
         return -1
 
+    def write_queue(self):
+        """The service reads the play queue from disk (can be thousands of songs)."""
+        _write_json(pc.queue_file(), [[s["path"], s["title"], s["artist"]] for s in self.view])
+        self.queue_dirty = False
+
+    # ---- selection + delete
+    def row_long(self, row):
+        self.sel_mode = True
+        self.toggle_sel(row.path, True)
+
+    def row_tap(self, row):
+        if row.long_fired:
+            return
+        if self.sel_mode:
+            self.toggle_sel(row.path)
+        else:
+            self.play_view(row.idx)
+
+    def toggle_sel(self, path, force=None):
+        on = (path not in self.selected) if force is None else force
+        if on:
+            self.selected.add(path)
+        else:
+            self.selected.discard(path)
+        self._sel_changed()
+
+    def sel_all(self):
+        self.selected = set(s["path"] for s in self.view)
+        self._sel_changed()
+
+    def sel_clear(self):
+        self.selected.clear()
+        self.sel_mode = False
+        self._sel_changed()
+
+    def _sel_changed(self):
+        n = len(self.selected)
+        self.sel_text = "%d selected" % n
+        if n == 0:
+            self.sel_mode = False
+        for d in self.rv.data:
+            d["sel"] = d["path"] in self.selected
+        self.rv.refresh_from_data()
+
+    def ask_delete(self):
+        n = len(self.selected)
+        if not n:
+            return
+        Confirm(title="Delete %d song%s?" % (n, "" if n == 1 else "s"),
+                msg="Delete from phone removes the audio files.\n"
+                    "Remove from list only hides them here\n(the refresh button brings them back).").open()
+
+    def do_delete(self, files):
+        songs = [s for s in self.songs if s["path"] in self.selected]
+        paths = [s["path"] for s in songs]
+        self.sel_clear()
+        if not songs:
+            return
+        if not files:
+            self.hidden |= set(paths)
+            save_hidden(self.hidden)
+            self._drop(paths)
+        elif platform == "android":
+            self._delete_android(songs)
+        else:
+            gone = []
+            for s in songs:
+                try:
+                    os.remove(s["path"])
+                    gone.append(s["path"])
+                except Exception:
+                    pass
+            self._drop(gone)
+
+    def _delete_android(self, songs):
+        try:
+            from jnius import autoclass
+            sdk = autoclass("android.os.Build$VERSION").SDK_INT
+            act = get_activity()
+            resolver = act.getContentResolver()
+            MediaAudio = autoclass("android.provider.MediaStore$Audio$Media")
+            ContentUris = autoclass("android.content.ContentUris")
+            uris, by_uri = [], []
+            for s in songs:
+                if s.get("mid") is not None:
+                    uris.append(ContentUris.withAppendedId(MediaAudio.EXTERNAL_CONTENT_URI,
+                                                           int(s["mid"])))
+                    by_uri.append(s["path"])
+            if sdk >= 30 and uris:
+                # Android shows its own "allow this app to delete N songs?" dialog
+                MediaStore = autoclass("android.provider.MediaStore")
+                lst = autoclass("java.util.ArrayList")()
+                for u in uris:
+                    lst.add(u)
+                pi = MediaStore.createDeleteRequest(resolver, lst)
+                self._del_paths = by_uri
+                act.startIntentSenderForResult(pi.getIntentSender(), DEL_REQ, None, 0, 0, 0)
+                return
+            gone = []
+            for s in songs:
+                ok = False
+                try:
+                    os.remove(s["path"])
+                    ok = True
+                except Exception:
+                    pass
+                if not ok and s.get("mid") is not None:
+                    try:
+                        u = ContentUris.withAppendedId(MediaAudio.EXTERNAL_CONTENT_URI,
+                                                       int(s["mid"]))
+                        ok = resolver.delete(u, None, None) > 0
+                    except Exception:
+                        ok = False
+                if ok:
+                    gone.append(s["path"])
+            if len(gone) < len(songs):
+                self.toast("Some files can't be deleted on this Android version")
+            self._drop(gone)
+        except Exception:
+            self.toast("Delete failed")
+
+    def _on_activity_result(self, code, result, intent):
+        if code != DEL_REQ:
+            return
+        paths = list(self._del_paths)
+        Clock.schedule_once(lambda dt: self._after_delete(result == -1, paths))
+
+    def _after_delete(self, ok, paths):
+        if ok:
+            self._drop(paths)
+        else:
+            self.toast("Delete cancelled")
+
+    def _drop(self, paths):
+        ps = set(paths)
+        if not ps:
+            return
+        self.songs = [s for s in self.songs if s["path"] not in ps]
+        self._index()
+        self.refresh()
+        threading.Thread(target=save_cache, args=(list(self.songs),), daemon=True).start()
+        if self.cur_path in ps:
+            self.remote.send({"c": "stop"})
+            self.on_stopped()
+        elif self.remote.ready:
+            self.write_queue()
+            self.remote.send({"c": "queue"})
+        self.toast("%d song%s removed" % (len(ps), "" if len(ps) == 1 else "s"))
+
     # ---- theme
     def set_hue(self, h):
         self.hue = h
@@ -1847,118 +2173,175 @@ class GlassApp(App):
         Animation.cancel_all(t)
         (Animation(opacity=1, d=.2) + Animation(opacity=1, d=1.8) + Animation(opacity=0, d=.3)).start(t)
 
-    # ---- playback
+    # ---- playback (all real work happens in the service)
     def play_view(self, i, open_sheet=True):
         if not (0 <= i < len(self.view)):
             return
-        if open_sheet:
-            self.errs = 0
-        self.start(self.view[i])
+        self.cmd_play(self.view[i])
         if open_sheet:
             self.sheet.show()
 
+    def cmd_play(self, s):
+        reload_q = self.queue_dirty or not self.remote.ready
+        if reload_q:
+            self.write_queue()
+        now = time.time()
+        self.apply_song_ui(s)
+        self.playing = True
+        self.r_pos, self.r_t = 0.0, now
+        self.play_lock = now + .8
+        self.remote.send({"c": "play", "path": s["path"], "title": s["title"],
+                          "artist": s["artist"], "reload": 1 if reload_q else 0,
+                          "shuffle": self.shuffle, "repeat": self.repeat}, start=True)
+
     def apply_song_ui(self, s):
+        prep(s)
         self.cur_path = s["path"]
-        self.raw_title, self.raw_artist = s["title"], s["artist"]
-        self.cur_title, self.cur_artist = s.get("td", s["title"]), s.get("ad", s["artist"])
-        self.cur_letter = s.get("letter", "\u266a")
-        self.cur_hue = s.get("hue", hue_of(s["title"]))
+        self.cur_title, self.cur_artist = s["td"], s["ad"]
+        self.cur_letter = s["letter"]
+        self.cur_hue = s["hue"]
         self.has_song = True
         self.set_hue(self.cur_hue)
         self.mini.ids.cov.set_cover(s["path"], 160)
-        self.stage_cov.set_cover(s["path"], 400)
+        self.stage.ids.cov.set_cover(s["path"], 400)
         self.frac, self.t0 = 0, "0:00"
         self.mark_current()
 
-    def start(self, s):
-        self.apply_song_ui(s)
-        path = s["path"]
-        if self.engine.play(path):
-            self.playing = True
-            self.update_media_notification()
-        else:
-            self.playing = False
-            self.update_media_notification()
-            self.fail()
-
-    def fail(self):
-        self.errs += 1
-        self.toast("Can't play this file, skipping")
-        if self.errs <= max(1, len(self.view)):
-            Clock.schedule_once(lambda dt: self.go_next(), .6)
-
-    def on_err(self, gen):
-        if gen == self.engine.gen:
-            self.fail()
-
-    def on_end_raw(self, gen):
-        """Called when a track finishes (possibly from an Android thread)."""
-        if self.fg:
-            Clock.schedule_once(lambda dt: self.on_end(gen), 0)
-        else:
-            threading.Thread(target=self.bg_on_end, args=(gen,), daemon=True).start()
-
-    def on_end(self, gen):
-        if gen != self.engine.gen:
+    def on_state(self, m):
+        now = time.time()
+        path = m.get("path") or ""
+        if not path:
             return
-        if self.repeat == 2:
-            self.engine.seek(0)
-            self.engine.resume()
-        elif self.repeat == 1 or self.shuffle or self.cur_idx() < len(self.view) - 1:
-            self.go_next()
-        else:
-            self.playing = False
-        self.update_media_notification()
+        if path != self.cur_path:
+            self.apply_song_ui(self.by_path.get(path) or
+                               {"path": path, "title": m.get("title", ""),
+                                "artist": m.get("artist", "")})
+        if now >= self.play_lock:
+            self.playing = bool(m.get("playing"))
+            self.shuffle = bool(m.get("shuffle"))
+            self.repeat = int(m.get("repeat", 0))
+        self.r_pos = float(m.get("pos", 0))
+        self.r_dur = float(m.get("dur", 0))
+        self.r_t = now
 
-    def go_next(self, *a):
+    def on_stopped(self):
+        """Closed from the notification (or the playing song was deleted)."""
+        self.playing = False
+        self.has_song = False
+        self.cur_path = None
+        self.cur_title = self.cur_artist = ""
+        self.r_pos = self.r_dur = 0.0
+        self.remote.alive = False
+        if self.sheet.opened:
+            self.sheet.hide()
+        self.mark_current()
+
+    def _step_local(self, step):
         if not self.view:
             return
-        i = random.randrange(len(self.view)) if self.shuffle else (self.cur_idx() + 1) % len(self.view)
+        if step > 0 and self.shuffle:
+            i = random.randrange(len(self.view))
+        else:
+            i = (max(self.cur_idx(), 0) + step) % len(self.view)
         self.play_view(i, False)
 
+    def go_next(self, *a):
+        if self.remote.ready:
+            self.remote.send({"c": "next"})
+        else:
+            self._step_local(1)
+
     def go_prev(self, *a):
-        if not self.view:
-            return
-        if self.engine.pos() > 3:
-            self.engine.seek(0)
-            return
-        self.play_view((max(self.cur_idx(), 0) - 1) % len(self.view), False)
+        if self.remote.ready:
+            self.remote.send({"c": "prev"})
+        else:
+            self._step_local(-1)
 
     def toggle(self):
         if not self.cur_path:
             if self.view:
                 self.play_view(0, False)
             return
-        if self.engine.playing():
-            self.engine.pause()
-        else:
-            self.engine.resume()
-        self.playing = self.engine.playing()
-        self.update_media_notification()
+        if not self.remote.ready:               # service was killed: restart this song
+            s = self.by_path.get(self.cur_path)
+            if s:
+                self.cmd_play(s)
+            return
+        self.playing = not self.playing
+        self.play_lock = time.time() + .8
+        self.remote.send({"c": "toggle"})
+
+    def _mode(self):
+        self.play_lock = time.time() + .8
+        self.remote.send({"c": "mode", "shuffle": self.shuffle, "repeat": self.repeat})
 
     def toggle_shuffle(self):
         self.shuffle = not self.shuffle
+        self._mode()
 
     def cycle_repeat(self):
         self.repeat = (self.repeat + 1) % 3
+        self._mode()
+
+    def seek_frac(self, f):
+        if self.r_dur > 0:
+            self.r_pos, self.r_t = f * self.r_dur, time.time()
+            self.remote.send({"c": "seek", "sec": self.r_pos})
+
+    # ---- phone tilt (accelerometer) moves the cover in the player
+    def tilt_enable(self, on):
+        if platform != "android":
+            return
+        try:
+            from plyer import accelerometer
+            self._acc = accelerometer
+            if on and not self._acc_on:
+                accelerometer.enable()
+                self._acc_on = True
+            elif not on and self._acc_on:
+                accelerometer.disable()
+                self._acc_on = False
+        except Exception:
+            self._acc_on = False
+
+    def update_tilt(self, dt):
+        tx = ty = 0.0
+        if self._acc_on and self._acc is not None:
+            try:
+                ax, ay, az = self._acc.acceleration
+                if ax is not None:
+                    tx = max(-1.0, min(1.0, -ax / 6.0))
+                    if self._pitch is None:
+                        self._pitch = ay
+                    self._pitch += (ay - self._pitch) * .02     # neutral = how you hold it
+                    ty = max(-1.0, min(1.0, (ay - self._pitch) / 6.0))
+            except Exception:
+                pass
+        self.tilt_x += (tx - self.tilt_x) * .2
+        self.tilt_y += (ty - self.tilt_y) * .2
+        st = self.stage
+        st.px = max(-1.0, min(1.0, self.tilt_x + st.tx))
+        st.py = max(-1.0, min(1.0, self.tilt_y + st.ty))
+        st.bob = math.sin(self.t * 1.4) * dp(3) * (1.0 if self.playing else .3)
 
     # ---- per-frame
     def tick(self, dt):
+        now = time.time()
         self.t += dt
-        if self.cur_path:
-            d = self.engine.dur()
-            if d > 0:
-                pos = self.engine.pos()
-                if pos > 2:
-                    self.errs = 0
-                if not self.drag:
-                    self.frac = min(1.0, pos / d)
-                    self.sk.value = self.frac * 1000
-                    self.t0 = fmt(pos)
-                self.t1 = fmt(d)
-        if self.t - self._last_notification_update >= 10:
-            self._last_notification_update = self.t
-            self.update_media_notification()
+        for m in self.remote.pump(now):
+            e = m.get("e")
+            if e == "state":
+                self.on_state(m)
+            elif e == "stopped":
+                self.on_stopped()
+        if self.cur_path and self.r_dur > 0:
+            pos = self.r_pos + ((now - self.r_t) if self.playing else 0)
+            pos = max(0.0, min(self.r_dur, pos))
+            if not self.drag:
+                self.frac = pos / self.r_dur
+                self.sk.value = self.frac * 1000
+                self.t0 = fmt(pos)
+            self.t1 = fmt(self.r_dur)
         opened = self.sheet.opened
         if self.playing:
             if not opened:
@@ -1975,6 +2358,7 @@ class GlassApp(App):
             if self.playing:
                 self.ang = (self.ang + dt * 72) % 360
             self.bass = sum(self.bars[19:25]) / 6.0
+            self.update_tilt(dt)
             if self.playing or max(self.bars) > .01:
                 self.viz.draw()
 
