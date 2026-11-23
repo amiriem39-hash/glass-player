@@ -132,9 +132,87 @@ _LISTENERS = {}
 
 
 def _java_listeners():
-    """Small Java callbacks for the full-screen video overlay (created lazily, Android only)."""
+    """Small Java callbacks for the native video player (created lazily, Android only)."""
     if _LISTENERS:
         return _LISTENERS
+    from jnius import PythonJavaClass, java_method
+
+    def make(name, iface, sig, meth, ret=None):
+        # the class must be built with its java methods already in the body
+        # (pyjnius reads them when the class is created)
+        def __init__(self, cb):
+            PythonJavaClass.__init__(self)
+            self.cb = cb
+
+        def fn(self, *a):
+            self.cb(*a)
+            return ret
+        return type(name, (PythonJavaClass,), {
+            "__javainterfaces__": [iface], "__javacontext__": "app",
+            "__init__": __init__, meth: java_method(sig, name=meth)(fn)})
+
+    L = {}
+    L["Click"] = make("Click", "android/view/View$OnClickListener",
+                      "(Landroid/view/View;)V", "onClick")
+    L["Prep"] = make("Prep", "android/media/MediaPlayer$OnPreparedListener",
+                     "(Landroid/media/MediaPlayer;)V", "onPrepared")
+    L["Done"] = make("Done", "android/media/MediaPlayer$OnCompletionListener",
+                     "(Landroid/media/MediaPlayer;)V", "onCompletion")
+    L["Err"] = make("Err", "android/media/MediaPlayer$OnErrorListener",
+                    "(Landroid/media/MediaPlayer;II)Z", "onError", True)
+    L["Size"] = make("Size", "android/media/MediaPlayer$OnVideoSizeChangedListener",
+                     "(Landroid/media/MediaPlayer;II)V", "onVideoSizeChanged")
+    L["Lay"] = make("Lay", "android/view/View$OnLayoutChangeListener",
+                    "(Landroid/view/View;IIIIIIII)V", "onLayoutChange")
+
+    class Tex(PythonJavaClass):
+        __javainterfaces__ = ["android/view/TextureView$SurfaceTextureListener"]
+        __javacontext__ = "app"
+
+        def __init__(self, on_avail):
+            super().__init__()
+            self.on_avail = on_avail
+
+        @java_method("(Landroid/graphics/SurfaceTexture;II)V")
+        def onSurfaceTextureAvailable(self, st, w, h):
+            self.on_avail(st)
+
+        @java_method("(Landroid/graphics/SurfaceTexture;II)V")
+        def onSurfaceTextureSizeChanged(self, st, w, h):
+            pass
+
+        @java_method("(Landroid/graphics/SurfaceTexture;)Z")
+        def onSurfaceTextureDestroyed(self, st):
+            return True
+
+        @java_method("(Landroid/graphics/SurfaceTexture;)V")
+        def onSurfaceTextureUpdated(self, st):
+            pass
+
+    class SeekL(PythonJavaClass):
+        __javainterfaces__ = ["android/widget/SeekBar$OnSeekBarChangeListener"]
+        __javacontext__ = "app"
+
+        def __init__(self, on_change, on_start, on_stop):
+            super().__init__()
+            self.on_change, self.on_start, self.on_stop = on_change, on_start, on_stop
+
+        @java_method("(Landroid/widget/SeekBar;IZ)V")
+        def onProgressChanged(self, sb, p, user):
+            self.on_change(p, user)
+
+        @java_method("(Landroid/widget/SeekBar;)V")
+        def onStartTrackingTouch(self, sb):
+            self.on_start()
+
+        @java_method("(Landroid/widget/SeekBar;)V")
+        def onStopTrackingTouch(self, sb):
+            self.on_stop(sb.getProgress())
+
+    L["Tex"] = Tex
+    L["SeekL"] = SeekL
+    _LISTENERS.update(L)
+    return _LISTENERS
     from jnius import PythonJavaClass, java_method
 
     class Click(PythonJavaClass):
@@ -817,6 +895,16 @@ def draw_icon(k, cx, cy, sz, col):
         L((7.5, 13.5), (4.5, 16), (7.5, 18.5))
         if k == "repeat1":
             L((10.8, 11), (12.5, 10), (12.5, 14))
+    elif k in ("volup", "voldown"):
+        L((4, 9), (8, 9), (13, 5), (13, 19), (8, 15), (4, 15), (4, 9))
+        L((16, 12), (21, 12))
+        if k == "volup":
+            L((18.5, 9.5), (18.5, 14.5))
+    elif k == "full":
+        L((4, 9), (4, 4), (9, 4))
+        L((15, 4), (20, 4), (20, 9))
+        L((20, 15), (20, 20), (15, 20))
+        L((9, 20), (4, 20), (4, 15))
     elif k == "dots":
         for yy in (5.5, 12, 18.5):
             Ellipse(pos=(X(12) - 1.9 * u, Y(yy) - 1.9 * u), size=(3.8 * u, 3.8 * u))
@@ -1697,9 +1785,10 @@ KV = r'''
                 id: viz
                 size_hint_y: None
                 height: dp(78)
-                opacity: 1 if app.viz_on else 0
+                opacity: 1 if (app.viz_on and not app.vid_mode) else 0
             Stage:
                 id: stage
+                opacity: 0 if app.vid_mode else 1
                 size_hint: 1, 1
                 hue: app.cur_hue
                 letter: app.cur_letter
@@ -1789,21 +1878,31 @@ KV = r'''
                 pos_hint: {'center_x': .5}
                 on_release: app.go_prev()
             GBtn:
-                kind: 'repeat1' if app.repeat == 2 else 'repeat'
-                active: app.repeat > 0
+                kind: 'volup' if app.vid_mode else ('repeat1' if app.repeat == 2 else 'repeat')
+                active: True if app.vid_mode else app.repeat > 0
                 isz: .6
                 size_hint: None, None
                 size: dp(46), dp(46)
                 pos_hint: {'center_x': .5}
-                on_release: app.cycle_repeat()
+                on_release: app.vol_change(1) if app.vid_mode else app.cycle_repeat()
             GBtn:
-                kind: 'shuffle'
-                active: app.shuffle
+                kind: 'voldown' if app.vid_mode else 'shuffle'
+                active: True if app.vid_mode else app.shuffle
                 isz: .6
                 size_hint: None, None
                 size: dp(46), dp(46)
                 pos_hint: {'center_x': .5}
-                on_release: app.toggle_shuffle()
+                on_release: app.vol_change(-1) if app.vid_mode else app.toggle_shuffle()
+            GBtn:
+                kind: 'full'
+                active: True
+                isz: .6
+                size_hint: None, None
+                size: dp(46), (dp(46) if app.vid_mode else 0)
+                opacity: 1 if app.vid_mode else 0
+                disabled: not app.vid_mode
+                pos_hint: {'center_x': .5}
+                on_release: app.video_fullscreen(True)
             Widget:
             GBtn:
                 kind: 'dots'
@@ -2029,6 +2128,334 @@ KV = r'''
 '''
 
 
+
+@run_on_ui_thread
+def _ui(fn):
+    try:
+        fn()
+    except Exception as e:      # noqa
+        import traceback
+        traceback.print_exc()
+
+
+class VideoOverlay:
+    """Native video (MediaPlayer + TextureView) laid over the cover area, or full screen.
+    All Android views are touched on the UI thread only."""
+    FLAGS = 4 | 2 | 4096 | 1024 | 512 | 256     # immersive full screen
+
+    def __init__(self, app):
+        self.app = app
+        self.gen = 0
+        self.rect = None
+        self.reset()
+
+    def reset(self):
+        self.root = self.tv = self.mp = self.bar = None
+        self.btn_pp = self.lbl = self.sb = None
+        self.rlp = self.tlp = None
+        self.refs = []
+        self.prepared = False
+        self.preparing = False
+        self.want = True
+        self.vw = self.vh = self.cw = self.ch = 0
+        self.tsize = None
+        self.tracking = False
+        self.full = False
+        self.prev_orient = self.prev_ui = None
+        self.orient_i = 0
+
+    # ---- called from the Kivy thread
+    def start(self, uri, rect):
+        self.gen += 1
+        g = self.gen
+        self.rect = rect
+        _ui(lambda: self._open(uri, rect, g))
+
+    def close(self):
+        self.gen += 1
+        _ui(self._teardown)
+
+    def play(self):
+        self.want = True
+        mp = self.mp
+        if mp is not None and self.prepared:
+            _ui(lambda: mp.start())
+
+    def pause(self):
+        self.want = False
+        mp = self.mp
+        if mp is not None and self.prepared:
+            _ui(lambda: mp.pause())
+
+    def seek(self, ms):
+        mp = self.mp
+        if mp is not None and self.prepared:
+            _ui(lambda: mp.seekTo(int(ms)))
+
+    def pos_dur(self):
+        mp = self.mp
+        if mp is None or not self.prepared:
+            return 0, 0
+        try:
+            return mp.getCurrentPosition(), mp.getDuration()
+        except Exception:
+            return 0, 0
+
+    def set_visible(self, on):
+        _ui(lambda: self.root.setVisibility(0 if on else 4))
+
+    def set_rect(self, rect):
+        self.rect = rect
+        _ui(lambda: self._apply_rect())
+
+    def set_full(self, on):
+        self.full = on
+        _ui(lambda: self._set_full_ui(on))
+
+    def rotate(self):
+        _ui(self._rotate_ui)
+
+    def toggle_bar(self):
+        _ui(lambda: self.bar.setVisibility(8 if self.bar.getVisibility() == 0 else 0))
+
+    def ui_progress(self, pos, dur, playing):
+        _ui(lambda: self._progress_ui(pos, dur, playing))
+
+    # ---- UI thread
+    def _open(self, uri, rect, g):
+        try:
+            self._open2(uri, rect, g)
+        except Exception as e:      # noqa
+            import traceback
+            traceback.print_exc()
+            msg = str(e)[:60]
+            Clock.schedule_once(lambda dt: self.app.vid_error(msg))
+
+    def _open2(self, uri, rect, g):
+        from jnius import autoclass
+        L = _java_listeners()
+        act = get_activity()
+        self._teardown()
+        Uri = autoclass("android.net.Uri")
+        FrameLayout = autoclass("android.widget.FrameLayout")
+        LP = autoclass("android.widget.FrameLayout$LayoutParams")
+        LinearLayout = autoclass("android.widget.LinearLayout")
+        LLP = autoclass("android.widget.LinearLayout$LayoutParams")
+        TextureView = autoclass("android.view.TextureView")
+        MediaPlayer = autoclass("android.media.MediaPlayer")
+        Surface = autoclass("android.view.Surface")
+        Button = autoclass("android.widget.Button")
+        TextView = autoclass("android.widget.TextView")
+        SeekBar = autoclass("android.widget.SeekBar")
+        AColor = autoclass("android.graphics.Color")
+        JStr = autoclass("java.lang.String")
+        dens = act.getResources().getDisplayMetrics().density
+        K = lambda f: (lambda *a: Clock.schedule_once(lambda dt: f()))
+
+        root = FrameLayout(act)
+        root.setBackgroundColor(AColor.BLACK)
+        tv = TextureView(act)
+        tlp = LP(-1, -1)
+        tlp.gravity = 17
+        root.addView(tv, tlp)
+
+        mp = MediaPlayer()
+        mp.setDataSource(act, Uri.parse(uri))
+        refs = []
+
+        def alive():
+            return g == self.gen and self.mp is mp
+
+        def on_avail(st):
+            if not alive():
+                return
+            mp.setSurface(Surface(st))
+            if not self.preparing:
+                self.preparing = True
+                mp.prepareAsync()
+
+        def on_prep(*a):
+            if not alive():
+                return
+            self.prepared = True
+            try:
+                self.vw, self.vh = mp.getVideoWidth(), mp.getVideoHeight()
+            except Exception:
+                pass
+            self._fit()
+            if self.want:
+                mp.start()
+
+        def on_size(m, w, h):
+            if alive():
+                self.vw, self.vh = w, h
+                self._fit()
+
+        def on_layout(v, l, t, r, b, ol, ot, orr, ob):
+            if alive():
+                self.cw, self.ch = r - l, b - t
+                self._fit()
+
+        def on_err(m, what, extra):
+            if alive():
+                Clock.schedule_once(lambda dt: self.app.vid_error("%s/%s" % (what, extra)))
+
+        def on_done(*a):
+            if alive():
+                Clock.schedule_once(lambda dt: self.app.vid_done())
+
+        tex = L["Tex"](on_avail)
+        prep_l = L["Prep"](on_prep)
+        size_l = L["Size"](on_size)
+        lay_l = L["Lay"](on_layout)
+        err_l = L["Err"](on_err)
+        done_l = L["Done"](on_done)
+        tap_l = L["Click"](K(self.app.video_tap))
+        refs += [tex, prep_l, size_l, lay_l, err_l, done_l, tap_l]
+        tv.setSurfaceTextureListener(tex)
+        mp.setOnPreparedListener(prep_l)
+        mp.setOnVideoSizeChangedListener(size_l)
+        mp.setOnErrorListener(err_l)
+        mp.setOnCompletionListener(done_l)
+        root.addOnLayoutChangeListener(lay_l)
+        root.setOnClickListener(tap_l)
+
+        # full-screen controls (hidden while the video sits in the cover area)
+        bar = LinearLayout(act)
+        bar.setOrientation(0)
+        bar.setGravity(16)
+        bar.setBackgroundColor(AColor.argb(150, 0, 0, 0))
+        pd = int(8 * dens)
+        bar.setPadding(pd, pd, pd, pd)
+
+        def mkbtn(text, cb):
+            b = Button(act)
+            b.setText(JStr(text))
+            b.setTextColor(AColor.WHITE)
+            b.setBackgroundColor(AColor.argb(90, 255, 255, 255))
+            lis = L["Click"](K(cb))
+            refs.append(lis)
+            b.setOnClickListener(lis)
+            return b
+        btn_pp = mkbtn("Pause", self.app.video_toggle)
+        lbl = TextView(act)
+        lbl.setTextColor(AColor.WHITE)
+        lbl.setText(JStr("0:00 / 0:00"))
+        lbl.setPadding(pd, 0, pd, 0)
+        sb = SeekBar(act)
+        sb.setMax(1000)
+
+        def sb_change(p, user):
+            pass
+
+        def sb_start():
+            self.tracking = True
+
+        def sb_stop(p):
+            self.tracking = False
+            Clock.schedule_once(lambda dt: self.app.seek_frac(p / 1000.0))
+        seek_l = L["SeekL"](sb_change, sb_start, sb_stop)
+        refs.append(seek_l)
+        sb.setOnSeekBarChangeListener(seek_l)
+        bar.addView(btn_pp)
+        bar.addView(lbl)
+        bar.addView(sb, LLP(0, -2, 1.0))
+        bar.addView(mkbtn("Rotate", self.app.video_rotate))
+        bar.addView(mkbtn("Exit", lambda: self.app.video_fullscreen(False)))
+        blp = LP(-1, -2)
+        blp.gravity = 80
+        blp.setMargins(0, 0, 0, int(14 * dens))
+        root.addView(bar, blp)
+        bar.setVisibility(8)
+
+        x, y, w, h = rect
+        rlp = LP(max(1, w), max(1, h))
+        rlp.gravity = 51
+        rlp.setMargins(x, y, 0, 0)
+        act.addContentView(root, rlp)
+
+        self.root, self.tv, self.mp, self.bar = root, tv, mp, bar
+        self.btn_pp, self.lbl, self.sb = btn_pp, lbl, sb
+        self.rlp, self.tlp, self.refs = rlp, tlp, refs
+
+    def _fit(self):
+        if not (self.tv and self.vw and self.vh and self.cw and self.ch):
+            return
+        sc = min(self.cw / float(self.vw), self.ch / float(self.vh))
+        w, h = max(1, int(self.vw * sc)), max(1, int(self.vh * sc))
+        if self.tsize == (w, h):
+            return
+        self.tsize = (w, h)
+        self.tlp.width = w
+        self.tlp.height = h
+        self.tv.setLayoutParams(self.tlp)
+
+    def _apply_rect(self):
+        if self.root is None or self.full or not self.rect:
+            return
+        x, y, w, h = self.rect
+        self.rlp.width, self.rlp.height = max(1, w), max(1, h)
+        self.rlp.setMargins(x, y, 0, 0)
+        self.root.setLayoutParams(self.rlp)
+
+    def _set_full_ui(self, on):
+        if self.root is None:
+            return
+        act = get_activity()
+        decor = act.getWindow().getDecorView()
+        if on:
+            self.prev_orient = act.getRequestedOrientation()
+            self.prev_ui = decor.getSystemUiVisibility()
+            decor.setSystemUiVisibility(self.FLAGS)
+            act.setRequestedOrientation(10)         # follow the sensor: portrait and landscape
+            self.orient_i = 0
+            self.rlp.width = self.rlp.height = -1
+            self.rlp.setMargins(0, 0, 0, 0)
+            self.bar.setVisibility(0)
+            self.root.setLayoutParams(self.rlp)
+        else:
+            self.bar.setVisibility(8)
+            if self.prev_orient is not None:
+                act.setRequestedOrientation(self.prev_orient)
+            if self.prev_ui is not None:
+                decor.setSystemUiVisibility(self.prev_ui)
+            self.prev_orient = self.prev_ui = None
+            self._apply_rect()
+
+    def _rotate_ui(self):
+        if self.root is None or not self.full:
+            return
+        self.orient_i = (self.orient_i + 1) % 3
+        get_activity().setRequestedOrientation((10, 6, 7)[self.orient_i])
+
+    def _progress_ui(self, pos, dur, playing):
+        if self.root is None:
+            return
+        from jnius import autoclass
+        JStr = autoclass("java.lang.String")
+        if dur > 0 and not self.tracking:
+            self.sb.setProgress(int(pos * 1000.0 / dur))
+        self.lbl.setText(JStr("%s / %s" % (fmt(pos / 1000.0), fmt(dur / 1000.0))))
+        self.btn_pp.setText(JStr("Pause" if playing else "Play"))
+
+    def _teardown(self):
+        if self.root is None and self.mp is None:
+            return
+        if self.full:
+            try:
+                self._set_full_ui(False)
+            except Exception:
+                pass
+        mp, root = self.mp, self.root
+        for fn in (lambda: mp.stop(), lambda: mp.release(),
+                   lambda: root.getParent().removeView(root)):
+            try:
+                fn()
+            except Exception:
+                pass
+        self.reset()
+
+
 # ------------------------------------------------------------ app
 DEL_REQ = 7311
 BG_REQ = 7312
@@ -2092,6 +2519,7 @@ class GlassApp(App):
     bg_col = NumericProperty(0)              # preset colour index
     bg_tex = ObjectProperty(None, allownone=True)
     sort_mode = StringProperty("default")
+    vid_mode = BooleanProperty(False)
     SKEYS = ("tilt_on", "theme_auto", "accent_hue", "row_fill", "mini_op",
              "rad_row", "fx3d", "sway", "viz_on", "flip",
              "glow_on", "bg_img", "bg_dim", "bg_col", "sort_mode")
@@ -2395,105 +2823,132 @@ class GlassApp(App):
         self.refresh()
         self.toast("%d video%s added" % (len(out), "" if len(out) == 1 else "s"))
 
+    # ---- video player (in the cover area, or full screen)
+    def _stage_rect(self):
+        st = self.stage
+        x, y = st.to_window(st.x, st.y)
+        return (int(x), int(Window.height - (y + st.height)), int(st.width), int(st.height))
+
     def play_video(self, s):
         if platform != "android":
             self.toast("Videos play on the phone only")
             return
-        if self._vid:
+        if self.playing and not self.vid_mode:
+            self.toggle()                       # pause the music first
+        prep(s)
+        was_full = self.vid_full
+        self.vid_cur = s
+        self.vid_mode = True
+        self.vid_full = False
+        self._vid_vis = None
+        self.cur_path = s["path"]
+        self.cur_title, self.cur_artist = s["td"], s["ad"]
+        self.cur_letter, self.cur_hue = s["letter"], s["hue"]
+        self.has_song = True
+        self.set_hue(self.cur_hue)
+        self.mini.ids.cov.set_cover(s["path"], 160)
+        self.frac, self.t0, self.t1 = 0, "0:00", "0:00"
+        self.r_pos = self.r_dur = 0.0
+        self.playing = True
+        self.mark_current()
+        if not self.sheet.opened:
+            self.sheet.show()
+        self.vo.start(s["path"], self._stage_rect())
+        if was_full:
+            self.video_fullscreen(True)
+
+    def vid_exit(self):
+        if not self.vid_mode:
+            return
+        self.vid_mode = False
+        self.vid_full = False
+        self.playing = False
+        self.vo.close()
+
+    def vid_error(self, msg=""):
+        self.vid_exit()
+        self.toast("Can't play this video" + (" (%s)" % msg if msg else ""))
+
+    def vid_done(self):
+        if not self.vid_mode:
+            return
+        nxt = self._vid_neighbor(1)
+        if nxt is not None and nxt is not self.vid_cur:
+            self.play_video(nxt)
+        else:
+            self.playing = False
+
+    def _vid_neighbor(self, step):
+        vids = [x for x in self.view if x.get("video")]
+        if not vids:
+            return None
+        cur = self.vid_cur["path"] if self.vid_cur else None
+        i = next((k for k, x in enumerate(vids) if x["path"] == cur), -1)
+        return vids[(i + step) % len(vids)]
+
+    def vid_step(self, step):
+        s = self._vid_neighbor(step)
+        if s is not None:
+            self.play_video(s)
+
+    def video_toggle(self):
+        if not self.vid_mode:
             return
         if self.playing:
-            self.toggle()                       # pause the music first
-        self._vid = {"pending": True}
-        self._vid_open_ui(s["path"])
+            self.vo.pause()
+            self.playing = False
+        else:
+            self.vo.play()
+            self.playing = True
 
-    @run_on_ui_thread
-    def _vid_open_ui(self, uri_str):
-        try:
-            from jnius import autoclass
-            act = get_activity()
-            L = _java_listeners()
-            Uri = autoclass("android.net.Uri")
-            FrameLayout = autoclass("android.widget.FrameLayout")
-            LP = autoclass("android.widget.FrameLayout$LayoutParams")
-            VideoView = autoclass("android.widget.VideoView")
-            MC = autoclass("android.widget.MediaController")
-            Button = autoclass("android.widget.Button")
-            AColor = autoclass("android.graphics.Color")
-            dens = act.getResources().getDisplayMetrics().density
-            decor = act.getWindow().getDecorView()
-            st = {"prev": act.getRequestedOrientation(), "ui": decor.getSystemUiVisibility(),
-                  "decor": decor, "land": True}
-            root = FrameLayout(act)
-            root.setBackgroundColor(AColor.BLACK)
-            vv = VideoView(act)
-            vv.setZOrderMediaOverlay(True)
-            lp = LP(-1, -1)
-            lp.gravity = 17                     # centre
-            root.addView(vv, lp)
-            mc = MC(act)
-            mc.setAnchorView(vv)
-            vv.setMediaController(mc)
-            vv.setVideoURI(Uri.parse(uri_str))
-            done = L["Done"](lambda: Clock.schedule_once(lambda dt: self.video_close()))
-            err = L["Err"](lambda: Clock.schedule_once(lambda dt: self._vid_failed()))
-            vv.setOnCompletionListener(done)
-            vv.setOnErrorListener(err)
-            refs = [done, err]
-
-            def rotate():
-                st["land"] = not st["land"]
-                act.setRequestedOrientation(6 if st["land"] else 7)
-
-            def mkbtn(text, gravity, cb):
-                b = Button(act)
-                b.setText(text)
-                b.setTextColor(AColor.WHITE)
-                b.setBackgroundColor(AColor.argb(140, 0, 0, 0))
-                blp = LP(-2, -2)
-                blp.gravity = gravity
-                m = int(16 * dens)
-                blp.setMargins(m, int(28 * dens), m, m)
-                lis = L["Click"](cb)
-                refs.append(lis)
-                b.setOnClickListener(lis)
-                root.addView(b, blp)
-            mkbtn("Close", 51, lambda: Clock.schedule_once(lambda dt: self.video_close()))
-            mkbtn("Rotate", 53, rotate)
-            st.update(root=root, vv=vv, mc=mc)
-            self._vid = st
-            self._vid_refs = refs
-            act.setRequestedOrientation(6)      # landscape
-            decor.setSystemUiVisibility(4 | 2 | 4096 | 1024 | 512 | 256)
-            act.addContentView(root, LP(-1, -1))
-            vv.start()
-        except Exception:
-            Clock.schedule_once(lambda dt: self._vid_failed())
-
-    def _vid_failed(self):
-        self.video_close()
-        self.toast("Can't play this video")
-
-    def video_close(self):
-        if self._vid is not None:
-            self._vid_close_ui()
-
-    @run_on_ui_thread
-    def _vid_close_ui(self):
-        st = self._vid
-        self._vid = None
-        if not st:
+    def video_tap(self):
+        if not self.vid_mode:
             return
-        act = get_activity()
-        for fn in (lambda: st["mc"].hide(),
-                   lambda: st["vv"].stopPlayback(),
-                   lambda: st["root"].getParent().removeView(st["root"]),
-                   lambda: act.setRequestedOrientation(st["prev"]),
-                   lambda: st["decor"].setSystemUiVisibility(st["ui"])):
-            try:
-                fn()
-            except Exception:
-                pass
-        self._vid_refs = []
+        if self.vid_full:
+            self.vo.toggle_bar()
+        else:
+            self.video_toggle()
+
+    def video_fullscreen(self, on=None):
+        if not self.vid_mode:
+            return
+        on = (not self.vid_full) if on is None else on
+        self.vid_full = on
+        self._vid_vis = None
+        self.vo.set_full(on)
+
+    def video_rotate(self):
+        self.vo.rotate()
+
+    def vol_change(self, d):
+        if platform != "android":
+            return
+        try:
+            from jnius import cast
+            am = cast("android.media.AudioManager", get_activity().getSystemService("audio"))
+            am.adjustStreamVolume(3, 1 if d > 0 else -1, 1)
+        except Exception:
+            self.toast("Volume control failed")
+
+    def _vid_tick(self, now):
+        vo = self.vo
+        shown = self.sheet.opened or self.vid_full
+        if shown != self._vid_vis:
+            self._vid_vis = shown
+            vo.set_visible(shown)
+        if shown and not self.vid_full:
+            r = self._stage_rect()
+            if r != vo.rect:
+                vo.set_rect(r)
+        if now - self._vid_poll >= .25:
+            self._vid_poll = now
+            pos, dur = vo.pos_dur()
+            if dur > 0:
+                self.r_dur = dur / 1000.0
+                if not self.drag:
+                    self.r_pos, self.r_t = pos / 1000.0, now
+            if self.vid_full:
+                vo.ui_progress(pos, dur, self.playing)
 
     # ---- equalizer
     def eq_changed(self):
@@ -2763,8 +3218,11 @@ class GlassApp(App):
         self.load_settings()
         self._load_bg()
         self.videos = load_videos()
-        self._vid = None
-        self._vid_refs = []
+        self.vo = VideoOverlay(self)
+        self.vid_cur = None
+        self.vid_full = False
+        self._vid_vis = None
+        self._vid_poll = 0.0
         Builder.load_string(KV)
         return Root()
 
@@ -2944,6 +3402,9 @@ class GlassApp(App):
 
     # ---- lifecycle: the service keeps playing, we only tell it whether we are visible
     def on_pause(self):
+        if self.vid_mode and self.playing:
+            self.vo.pause()
+            self.playing = False
         self.fg = False
         self.remote.notify({"c": "fg", "v": 0})
         self.tilt_enable(False)
@@ -2964,8 +3425,8 @@ class GlassApp(App):
 
     def on_key(self, win, key, *a):
         if key == 27:
-            if self._vid:
-                self.video_close()
+            if self.vid_full:
+                self.video_fullscreen(False)
                 return True
             if self.sel_mode:
                 self.sel_clear()
@@ -3122,6 +3583,8 @@ class GlassApp(App):
     def do_delete(self, files):
         vsel = set(v["path"] for v in self.videos) & self.selected
         if vsel:
+            if self.vid_mode and self.vid_cur and self.vid_cur["path"] in vsel:
+                self.vid_exit()
             self.videos = [v for v in self.videos if v["path"] not in vsel]
             save_videos(self.videos)
             self.selected -= vsel
@@ -3280,6 +3743,8 @@ class GlassApp(App):
             self.sheet.show()
 
     def cmd_play(self, s):
+        if self.vid_mode:
+            self.vid_exit()
         reload_q = self.queue_dirty or not self.remote.ready
         if reload_q:
             self.write_queue()
@@ -3306,6 +3771,8 @@ class GlassApp(App):
         self.mark_current()
 
     def on_state(self, m):
+        if self.vid_mode:
+            return
         now = time.time()
         path = m.get("path") or ""
         if not path:
@@ -3324,6 +3791,8 @@ class GlassApp(App):
 
     def on_stopped(self):
         """Closed from the notification (or the playing song was deleted)."""
+        if self.vid_mode:
+            return
         self.playing = False
         self.has_song = False
         self.cur_path = None
@@ -3350,18 +3819,27 @@ class GlassApp(App):
         self.play_view(i, False)
 
     def go_next(self, *a):
+        if self.vid_mode:
+            self.vid_step(1)
+            return
         if self.remote.ready:
             self.remote.send({"c": "next"})
         else:
             self._step_local(1)
 
     def go_prev(self, *a):
+        if self.vid_mode:
+            self.vid_step(-1)
+            return
         if self.remote.ready:
             self.remote.send({"c": "prev"})
         else:
             self._step_local(-1)
 
     def toggle(self):
+        if self.vid_mode:
+            self.video_toggle()
+            return
         if not self.cur_path:
             aud = [k for k, x in enumerate(self.view) if not x.get("video")]
             if aud:
@@ -3389,6 +3867,11 @@ class GlassApp(App):
         self._mode()
 
     def seek_frac(self, f):
+        if self.vid_mode:
+            if self.r_dur > 0:
+                self.r_pos, self.r_t = f * self.r_dur, time.time()
+                self.vo.seek(f * self.r_dur * 1000)
+            return
         if self.r_dur > 0:
             self.r_pos, self.r_t = f * self.r_dur, time.time()
             self.remote.send({"c": "seek", "sec": self.r_pos})
@@ -3447,6 +3930,8 @@ class GlassApp(App):
                 self.on_state(m)
             elif e == "stopped":
                 self.on_stopped()
+        if self.vid_mode:
+            self._vid_tick(now)
         if self.cur_path and self.r_dur > 0:
             pos = self.r_pos + ((now - self.r_t) if self.playing else 0)
             pos = max(0.0, min(self.r_dur, pos))
