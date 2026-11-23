@@ -121,6 +121,63 @@ def get_activity():
     return autoclass("org.kivy.android.PythonActivity").mActivity
 
 
+if platform == "android":
+    from android.runnable import run_on_ui_thread
+else:
+    def run_on_ui_thread(f):
+        return f
+
+VIDEO_THUMB = {}          # video uri -> thumbnail jpg (filled from videos.json)
+_LISTENERS = {}
+
+
+def _java_listeners():
+    """Small Java callbacks for the full-screen video overlay (created lazily, Android only)."""
+    if _LISTENERS:
+        return _LISTENERS
+    from jnius import PythonJavaClass, java_method
+
+    class Click(PythonJavaClass):
+        __javainterfaces__ = ["android/view/View$OnClickListener"]
+        __javacontext__ = "app"
+
+        def __init__(self, cb):
+            super().__init__()
+            self.cb = cb
+
+        @java_method("(Landroid/view/View;)V")
+        def onClick(self, v):
+            self.cb()
+
+    class Done(PythonJavaClass):
+        __javainterfaces__ = ["android/media/MediaPlayer$OnCompletionListener"]
+        __javacontext__ = "app"
+
+        def __init__(self, cb):
+            super().__init__()
+            self.cb = cb
+
+        @java_method("(Landroid/media/MediaPlayer;)V")
+        def onCompletion(self, mp):
+            self.cb()
+
+    class Err(PythonJavaClass):
+        __javainterfaces__ = ["android/media/MediaPlayer$OnErrorListener"]
+        __javacontext__ = "app"
+
+        def __init__(self, cb):
+            super().__init__()
+            self.cb = cb
+
+        @java_method("(Landroid/media/MediaPlayer;II)Z")
+        def onError(self, mp, what, extra):
+            self.cb()
+            return True
+
+    _LISTENERS.update(Click=Click, Done=Done, Err=Err)
+    return _LISTENERS
+
+
 # ------------------------------------------------------------ library
 def storage_roots():
     roots = [p for p in ("/storage/emulated/0", "/sdcard") if os.path.isdir(p)]
@@ -477,6 +534,36 @@ except OSError:
     pass
 
 
+def _video_file():
+    return os.path.join(pc.data_dir(), "videos.json")
+
+
+def load_videos():
+    try:
+        with open(_video_file(), encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return []
+    out = []
+    for v in data if isinstance(data, list) else []:
+        if isinstance(v, dict) and v.get("path"):
+            v["video"] = True
+            v.setdefault("title", "Video")
+            v["artist"] = "Video"
+            v.setdefault("mid", None)
+            v.setdefault("size", 0)
+            v.setdefault("mt", 0)
+            if v.get("thumb"):
+                VIDEO_THUMB[v["path"]] = v["thumb"]
+            out.append(v)
+    return out
+
+
+def save_videos(videos):
+    _write_json(_video_file(), [{k: v[k] for k in ("path", "title", "size", "mt", "thumb") if k in v}
+                                for v in videos])
+
+
 def _thumb_path(path, size, mt):
     h = hashlib.md5(("%s|%s|%d" % (path, mt, size)).encode("utf-8", "ignore")).hexdigest()
     return os.path.join(THUMBS, h + ".jpg")
@@ -505,9 +592,24 @@ class Covers:
         self.pending[key] = [cb]
         self.ex.submit(self._work, key)
 
+    def _pack(self, im):
+        px = list(im.resize((8, 8)).convert("RGB").getdata())
+        rr = sum(p[0] for p in px) / 64.0
+        gg = sum(p[1] for p in px) / 64.0
+        bb = sum(p[2] for p in px) / 64.0
+        hue = None
+        if max(rr, gg, bb) - min(rr, gg, bb) >= 12:
+            hue = colorsys.rgb_to_hsv(rr / 255, gg / 255, bb / 255)[0] * 360
+        return (im.size[0], im.size[1], im.tobytes(), hue)
+
     def _load(self, path, size):
         if not Image:
             return None
+        vt = VIDEO_THUMB.get(path)
+        if vt is not None:                           # a video: use its saved frame
+            if not os.path.isfile(vt):
+                return None
+            return self._pack(ImageOps.fit(Image.open(vt).convert("RGBA"), (size, size)))
         try:
             mt = int(os.path.getmtime(path))
         except OSError:
@@ -1930,6 +2032,12 @@ KV = r'''
 # ------------------------------------------------------------ app
 DEL_REQ = 7311
 BG_REQ = 7312
+VID_REQ = 7313
+# sort choices: (key, label)
+SORTS = [("default", "Default (file name)"), ("title", "Title: A to Z"),
+         ("title_d", "Title: Z to A"), ("artist", "Artist: A to Z"),
+         ("new", "Newest first"), ("old", "Oldest first"),
+         ("big", "Biggest file first"), ("small", "Smallest file first")]
 # preset background colours for the song list (used behind / without a photo)
 BG_PRESETS = [(.03, .024, .07), (0., 0., 0.), (.02, .05, .13),
               (.13, .02, .05), (.02, .09, .05), (.10, .05, .02)]
@@ -1983,12 +2091,13 @@ class GlassApp(App):
     bg_dim = NumericProperty(.45)            # darkening over the photo
     bg_col = NumericProperty(0)              # preset colour index
     bg_tex = ObjectProperty(None, allownone=True)
+    sort_mode = StringProperty("default")
     SKEYS = ("tilt_on", "theme_auto", "accent_hue", "row_fill", "mini_op",
              "rad_row", "fx3d", "sway", "viz_on", "flip",
-             "glow_on", "bg_img", "bg_dim", "bg_col")
+             "glow_on", "bg_img", "bg_dim", "bg_col", "sort_mode")
     DEFAULTS = dict(tilt_on=True, theme_auto=True, accent_hue=260, row_fill=.09,
                     mini_op=.88, rad_row=22, fx3d=1.0, sway=1.0, viz_on=True, flip=True,
-                    glow_on=True, bg_img="", bg_dim=.45, bg_col=0)
+                    glow_on=True, bg_img="", bg_dim=.45, bg_col=0, sort_mode="default")
     EQ_DEF = {"c": "eq", "on": False, "bands": [0, 0, 0, 0, 0], "bass": 0, "virt": 0, "loud": 0}
 
     def goto_playlist(self):
@@ -2002,7 +2111,9 @@ class GlassApp(App):
 
     def _menu(self, title, items):
         from kivy.uix.modalview import ModalView
-        mv = ModalView(size_hint=(.82, None), height=dp(64 + 56 * len(items)),
+        from kivy.uix.scrollview import ScrollView
+        h = min(dp(64 + 56 * len(items)), Window.height * .88)
+        mv = ModalView(size_hint=(.82, None), height=h,
                        background="", background_color=(0, 0, 0, 0),
                        overlay_color=(0, 0, 0, .6))
         box = BoxLayout(orientation="vertical", padding=dp(16), spacing=dp(8))
@@ -2012,11 +2123,16 @@ class GlassApp(App):
         box.bind(pos=lambda w, v: setattr(rr, "pos", v),
                  size=lambda w, v: setattr(rr, "size", v))
         box.add_widget(Label(text=title, font_size=sp(18), size_hint_y=None, height=dp(30)))
+        inner = BoxLayout(orientation="vertical", spacing=dp(8), size_hint_y=None)
+        inner.bind(minimum_height=inner.setter("height"))
         for txt, fn in items:
             b = TxtBtn(text=txt)
             b.bgc = [1, 1, 1, .08]
             b.bind(on_release=lambda w, f=fn: (mv.dismiss(), f()))
-            box.add_widget(b)
+            inner.add_widget(b)
+        sv = ScrollView(bar_width=dp(3))
+        sv.add_widget(inner)
+        box.add_widget(sv)
         mv.add_widget(box)
         mv.open()
 
@@ -2142,18 +2258,242 @@ class GlassApp(App):
     def open_more(self, btn):
         wx, wy = btn.to_window(*btn.pos)
         ov = FloatLayout()
-        box = BoxLayout(size_hint=(None, None), size=(dp(150), dp(58)), padding=dp(5))
+        entries = [("Equalizer", self.open_eq), ("Sort songs", self.open_sort),
+                   ("Add video", self.pick_video)]
+        w, h = dp(170), dp(10 + 53 * len(entries))
+        box = BoxLayout(orientation="vertical", size_hint=(None, None), size=(w, h),
+                        padding=dp(5), spacing=dp(5))
         self._dark(box, 18)
-        box.pos = (wx - dp(158), wy + btn.height / 2 - dp(29))
-        b = TxtBtn(text="Equalizer")
-        b.bgc = [1, 1, 1, .1]
-        b.height = dp(48)
-        box.add_widget(b)
-        ov.add_widget(box)
+        box.pos = (max(dp(8), wx - w - dp(8)),
+                   max(dp(8), min(wy + btn.height / 2 - dp(29), Window.height - h - dp(8))))
         close = lambda *a: Window.remove_widget(ov)
-        b.bind(on_release=lambda *a: (close(), self.open_eq()))
+        for txt, fn in entries:
+            b = TxtBtn(text=txt)
+            b.bgc = [1, 1, 1, .1]
+            b.height = dp(48)
+            b.bind(on_release=lambda w, f=fn: (close(), f()))
+            box.add_widget(b)
+        ov.add_widget(box)
         ov.bind(on_touch_down=lambda w, t: (close(), True)[1] if not box.collide_point(*t.pos) else False)
         Window.add_widget(ov)
+
+    # ---- sorting
+    def open_sort(self):
+        cur = self.sort_mode
+        self._menu("Sort songs by",
+                   [(("\u2022  " if k == cur else "") + lab, (lambda k=k: self.set_sort(k)))
+                    for k, lab in SORTS])
+
+    def set_sort(self, mode):
+        self.pset("sort_mode", mode)
+        self.refresh()
+        if self.remote.ready:
+            self.write_queue()
+            self.remote.send({"c": "queue"})
+        self.toast("Sorted: " + dict(SORTS).get(mode, mode))
+
+    def _sorted(self, lst):
+        m = self.sort_mode
+        if m == "title":
+            return sorted(lst, key=lambda s: s["title"].casefold())
+        if m == "title_d":
+            return sorted(lst, key=lambda s: s["title"].casefold(), reverse=True)
+        if m == "artist":
+            return sorted(lst, key=lambda s: (s["artist"].casefold(), s["title"].casefold()))
+        if m in ("new", "old"):
+            return sorted(lst, key=lambda s: s.get("mt") or 0, reverse=(m == "new"))
+        if m in ("big", "small"):
+            return sorted(lst, key=lambda s: s.get("size") or 0, reverse=(m == "big"))
+        return lst
+
+    # ---- videos in the playlist
+    def pick_video(self):
+        if platform != "android":
+            self.toast("Adding videos works on the phone only")
+            return
+        try:
+            from jnius import autoclass
+            Intent = autoclass("android.content.Intent")
+            it = Intent(Intent.ACTION_OPEN_DOCUMENT)
+            it.setType("video/*")
+            it.addCategory(Intent.CATEGORY_OPENABLE)
+            it.putExtra("android.intent.extra.ALLOW_MULTIPLE", True)
+            it.addFlags(1 | 64)         # read + persistable permission
+            get_activity().startActivityForResult(it, VID_REQ)
+        except Exception:
+            self.toast("Could not open the file picker")
+
+    def _add_videos(self, uris):
+        """Worker thread: read name/size, grab a preview frame, then update the list."""
+        out = []
+        try:
+            from jnius import autoclass
+            act = get_activity()
+            res = act.getContentResolver()
+            Uri = autoclass("android.net.Uri")
+            MMR = autoclass("android.media.MediaMetadataRetriever")
+            Bitmap = autoclass("android.graphics.Bitmap")
+            CF = autoclass("android.graphics.Bitmap$CompressFormat")
+            FOS = autoclass("java.io.FileOutputStream")
+        except Exception:
+            Clock.schedule_once(lambda dt: self.toast("Could not add video"))
+            return
+        known = set(v["path"] for v in self.videos)
+        for us in uris:
+            if us in known:
+                continue
+            title, size, thumb = "Video", 0, ""
+            try:
+                uri = Uri.parse(us)
+                cur = res.query(uri, ["_display_name", "_size"], None, None, None)
+                if cur:
+                    try:
+                        if cur.moveToFirst():
+                            n = cur.getString(cur.getColumnIndex("_display_name"))
+                            if n:
+                                title = os.path.splitext(n)[0]
+                            size = cur.getLong(cur.getColumnIndex("_size"))
+                    finally:
+                        cur.close()
+                try:
+                    r = MMR()
+                    r.setDataSource(act, uri)
+                    bmp = r.getFrameAtTime(1000000)
+                    if bmp is None:
+                        bmp = r.getFrameAtTime()
+                    r.release()
+                    if bmp is not None:
+                        w0, h0 = bmp.getWidth(), bmp.getHeight()
+                        sc = 320.0 / max(w0, h0, 1)
+                        small = Bitmap.createScaledBitmap(bmp, max(1, int(w0 * sc)),
+                                                          max(1, int(h0 * sc)), True)
+                        thumb = os.path.join(THUMBS, "vid_" + hashlib.md5(us.encode()).hexdigest() + ".jpg")
+                        fo = FOS(thumb)
+                        small.compress(CF.JPEG, 85, fo)
+                        fo.flush()
+                        fo.close()
+                except Exception:
+                    thumb = ""
+            except Exception:
+                continue
+            v = {"path": us, "title": title, "artist": "Video", "mid": None, "size": int(size),
+                 "mt": int(time.time()), "video": True}
+            if thumb:
+                v["thumb"] = thumb
+            out.append(v)
+        Clock.schedule_once(lambda dt: self._videos_added(out))
+
+    def _videos_added(self, out):
+        if not out:
+            self.toast("Nothing new to add")
+            return
+        for v in out:
+            if v.get("thumb"):
+                VIDEO_THUMB[v["path"]] = v["thumb"]
+        self.videos += out
+        save_videos(self.videos)
+        self.refresh()
+        self.toast("%d video%s added" % (len(out), "" if len(out) == 1 else "s"))
+
+    def play_video(self, s):
+        if platform != "android":
+            self.toast("Videos play on the phone only")
+            return
+        if self._vid:
+            return
+        if self.playing:
+            self.toggle()                       # pause the music first
+        self._vid = {"pending": True}
+        self._vid_open_ui(s["path"])
+
+    @run_on_ui_thread
+    def _vid_open_ui(self, uri_str):
+        try:
+            from jnius import autoclass
+            act = get_activity()
+            L = _java_listeners()
+            Uri = autoclass("android.net.Uri")
+            FrameLayout = autoclass("android.widget.FrameLayout")
+            LP = autoclass("android.widget.FrameLayout$LayoutParams")
+            VideoView = autoclass("android.widget.VideoView")
+            MC = autoclass("android.widget.MediaController")
+            Button = autoclass("android.widget.Button")
+            AColor = autoclass("android.graphics.Color")
+            dens = act.getResources().getDisplayMetrics().density
+            decor = act.getWindow().getDecorView()
+            st = {"prev": act.getRequestedOrientation(), "ui": decor.getSystemUiVisibility(),
+                  "decor": decor, "land": True}
+            root = FrameLayout(act)
+            root.setBackgroundColor(AColor.BLACK)
+            vv = VideoView(act)
+            vv.setZOrderMediaOverlay(True)
+            lp = LP(-1, -1)
+            lp.gravity = 17                     # centre
+            root.addView(vv, lp)
+            mc = MC(act)
+            mc.setAnchorView(vv)
+            vv.setMediaController(mc)
+            vv.setVideoURI(Uri.parse(uri_str))
+            done = L["Done"](lambda: Clock.schedule_once(lambda dt: self.video_close()))
+            err = L["Err"](lambda: Clock.schedule_once(lambda dt: self._vid_failed()))
+            vv.setOnCompletionListener(done)
+            vv.setOnErrorListener(err)
+            refs = [done, err]
+
+            def rotate():
+                st["land"] = not st["land"]
+                act.setRequestedOrientation(6 if st["land"] else 7)
+
+            def mkbtn(text, gravity, cb):
+                b = Button(act)
+                b.setText(text)
+                b.setTextColor(AColor.WHITE)
+                b.setBackgroundColor(AColor.argb(140, 0, 0, 0))
+                blp = LP(-2, -2)
+                blp.gravity = gravity
+                m = int(16 * dens)
+                blp.setMargins(m, int(28 * dens), m, m)
+                lis = L["Click"](cb)
+                refs.append(lis)
+                b.setOnClickListener(lis)
+                root.addView(b, blp)
+            mkbtn("Close", 51, lambda: Clock.schedule_once(lambda dt: self.video_close()))
+            mkbtn("Rotate", 53, rotate)
+            st.update(root=root, vv=vv, mc=mc)
+            self._vid = st
+            self._vid_refs = refs
+            act.setRequestedOrientation(6)      # landscape
+            decor.setSystemUiVisibility(4 | 2 | 4096 | 1024 | 512 | 256)
+            act.addContentView(root, LP(-1, -1))
+            vv.start()
+        except Exception:
+            Clock.schedule_once(lambda dt: self._vid_failed())
+
+    def _vid_failed(self):
+        self.video_close()
+        self.toast("Can't play this video")
+
+    def video_close(self):
+        if self._vid is not None:
+            self._vid_close_ui()
+
+    @run_on_ui_thread
+    def _vid_close_ui(self):
+        st = self._vid
+        self._vid = None
+        if not st:
+            return
+        act = get_activity()
+        for fn in (lambda: st["mc"].hide(),
+                   lambda: st["vv"].stopPlayback(),
+                   lambda: st["root"].getParent().removeView(st["root"]),
+                   lambda: act.setRequestedOrientation(st["prev"]),
+                   lambda: st["decor"].setSystemUiVisibility(st["ui"])):
+            try:
+                fn()
+            except Exception:
+                pass
+        self._vid_refs = []
 
     # ---- equalizer
     def eq_changed(self):
@@ -2366,6 +2706,7 @@ class GlassApp(App):
             self.set_hue(self.hue)
             self._apply_flip()
             self._load_bg()
+            self.refresh()
             mv.dismiss()
             self.toast("Reset")
         rb.bind(on_release=reset)
@@ -2421,6 +2762,9 @@ class GlassApp(App):
         Window.bind(on_keyboard=self.on_key)
         self.load_settings()
         self._load_bg()
+        self.videos = load_videos()
+        self._vid = None
+        self._vid_refs = []
         Builder.load_string(KV)
         return Root()
 
@@ -2620,6 +2964,9 @@ class GlassApp(App):
 
     def on_key(self, win, key, *a):
         if key == 27:
+            if self._vid:
+                self.video_close()
+                return True
             if self.sel_mode:
                 self.sel_clear()
                 return True
@@ -2688,7 +3035,8 @@ class GlassApp(App):
 
     def refresh(self):
         q = self.q
-        self.view = [s for s in self.songs if q in (s["title"] + " " + s["artist"]).lower()]
+        self.view = self._sorted([s for s in (self.songs + self.videos)
+                                  if q in (s["title"] + " " + s["artist"]).lower()])
         self.queue_dirty = True
         data = []
         for i, s in enumerate(self.view):
@@ -2699,8 +3047,10 @@ class GlassApp(App):
                          "cur": s["path"] == self.cur_path,
                          "sel": s["path"] in self.selected})
         self.rv.data = data
-        self.nsongs = len(self.songs)
-        self.count_text = "%d songs" % len(self.songs)
+        self.nsongs = len(self.songs) + len(self.videos)
+        self.count_text = ("%d songs" % len(self.songs)) + (
+            ", %d video%s" % (len(self.videos), "" if len(self.videos) == 1 else "s")
+            if self.videos else "")
 
     def mark_current(self):
         for d in self.rv.data:
@@ -2715,7 +3065,8 @@ class GlassApp(App):
 
     def write_queue(self):
         """The service reads the play queue from disk (can be thousands of songs)."""
-        _write_json(pc.queue_file(), [[s["path"], s["title"], s["artist"]] for s in self.view])
+        _write_json(pc.queue_file(), [[s["path"], s["title"], s["artist"]]
+                                      for s in self.view if not s.get("video")])
         self.queue_dirty = False
 
     # ---- selection + delete
@@ -2728,6 +3079,8 @@ class GlassApp(App):
             return
         if self.sel_mode:
             self.toggle_sel(row.path)
+        elif 0 <= row.idx < len(self.view) and self.view[row.idx].get("video"):
+            self.play_video(self.view[row.idx])
         else:
             self.play_view(row.idx)
 
@@ -2763,9 +3116,17 @@ class GlassApp(App):
             return
         Confirm(title="Delete %d song%s?" % (n, "" if n == 1 else "s"),
                 msg="Delete from phone removes the audio files.\n"
-                    "Remove from list only hides them here\n(the refresh button brings them back).").open()
+                    "Remove from list only hides them here\n(the refresh button brings them back).\n"
+                    "Videos are only removed from the list.").open()
 
     def do_delete(self, files):
+        vsel = set(v["path"] for v in self.videos) & self.selected
+        if vsel:
+            self.videos = [v for v in self.videos if v["path"] not in vsel]
+            save_videos(self.videos)
+            self.selected -= vsel
+            self.refresh()
+            self.toast("%d video%s removed from the list" % (len(vsel), "" if len(vsel) == 1 else "s"))
         songs = [s for s in self.songs if s["path"] in self.selected]
         paths = [s["path"] for s in songs]
         self.sel_clear()
@@ -2835,6 +3196,30 @@ class GlassApp(App):
             self.toast("Delete failed")
 
     def _on_activity_result(self, code, result, intent):
+        if code == VID_REQ:
+            strs = []
+            if result == -1 and intent is not None:
+                try:
+                    uris = []
+                    cd = intent.getClipData()
+                    if cd is not None:
+                        for i in range(cd.getItemCount()):
+                            uris.append(cd.getItemAt(i).getUri())
+                    if not uris and intent.getData() is not None:
+                        uris.append(intent.getData())
+                    res = get_activity().getContentResolver()
+                    for u in uris:
+                        try:
+                            res.takePersistableUriPermission(u, 1)
+                        except Exception:
+                            pass
+                        strs.append(u.toString())
+                except Exception:
+                    strs = []
+            if strs:
+                Clock.schedule_once(lambda dt: threading.Thread(
+                    target=self._add_videos, args=(strs,), daemon=True).start())
+            return
         if code == BG_REQ:
             if result == -1 and intent is not None:
                 try:
@@ -2888,7 +3273,7 @@ class GlassApp(App):
 
     # ---- playback (all real work happens in the service)
     def play_view(self, i, open_sheet=True):
-        if not (0 <= i < len(self.view)):
+        if not (0 <= i < len(self.view)) or self.view[i].get("video"):
             return
         self.cmd_play(self.view[i])
         if open_sheet:
@@ -2950,12 +3335,18 @@ class GlassApp(App):
         self.mark_current()
 
     def _step_local(self, step):
-        if not self.view:
+        n = len(self.view)
+        aud = [k for k, x in enumerate(self.view) if not x.get("video")]
+        if not aud:
             return
         if step > 0 and self.shuffle:
-            i = random.randrange(len(self.view))
+            i = random.choice(aud)
         else:
-            i = (max(self.cur_idx(), 0) + step) % len(self.view)
+            i = max(self.cur_idx(), 0)
+            for _ in range(n):
+                i = (i + step) % n
+                if not self.view[i].get("video"):
+                    break
         self.play_view(i, False)
 
     def go_next(self, *a):
@@ -2972,8 +3363,9 @@ class GlassApp(App):
 
     def toggle(self):
         if not self.cur_path:
-            if self.view:
-                self.play_view(0, False)
+            aud = [k for k, x in enumerate(self.view) if not x.get("video")]
+            if aud:
+                self.play_view(aud[0], False)
             return
         if not self.remote.ready:               # service was killed: restart this song
             s = self.by_path.get(self.cur_path)
